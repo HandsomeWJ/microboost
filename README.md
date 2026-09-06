@@ -1,5 +1,14 @@
 # Microboost
 
+> **Fork notice:** this is a personal fork of [alexeygrigorev/microboost](https://github.com/alexeygrigorev/microboost)
+> by [Alexey Grigorev](https://github.com/alexeygrigorev), who wrote the original app. All credit for the
+> audio pipeline, UI, and VB-CABLE integration goes to him. This fork adds:
+>
+> - Boost cap raised from 5x to 50x (logarithmic slider, auto-calibrate can recommend up to 50x)
+> - System tray: minimise/close hides to the tray and keeps boosting; left-click reopens, right-click for Quit
+> - Settings section: auto-start boost, start hidden in tray, launch with Windows (per-user Run key)
+> - Cross-compiling from macOS via `cargo-xwin` (see Development)
+
 A Windows microphone booster that amplifies your mic for other apps (Discord, Teams, etc.) using a real-time audio pipeline through [VB-CABLE](https://vb-audio.com/Cable/) — a free virtual audio cable driver that creates a pair of connected audio devices (one for input, one for output) so audio can be routed between applications.
 
 <img src="screenshot.png" width="400" alt="Microboost screenshot">
@@ -26,13 +35,16 @@ On first launch, the app will offer to download and install VB-CABLE (free) auto
 
 ## Features
 
-- Real-time microphone boost from 0.1x to 5x (10% to 500%)
+- Real-time microphone boost from 0.1x to 50x (10% to 5000%)
 - Auto-calibration: detects your voice level and sets the boost to YouTube-recommended loudness (~-16 dBFS)
 - Noise gate: learns your background noise and suppresses it
 - Live waveform visualizer: see input vs boosted output in real-time
 - Per-microphone profiles: saves boost and noise gate settings per device
 - Mic hot-plug detection: auto-switches when devices connect/disconnect
 - Automatic VB-CABLE setup on first run
+- System tray: minimise/close hides to the tray and keeps boosting; optional start-hidden
+- Auto-start boost on launch (toggle in Settings)
+- Launch with Windows (toggle in Settings; uses the per-user Run registry key)
 - Test recording and playback to verify your levels
 - Lock-free audio pipeline (96.7 dB SNR)
 - Native UI built with egui
@@ -74,6 +86,8 @@ Recordings are saved to `%APPDATA%\Microboost\`.
 
 ### Build
 
+On Windows:
+
 ```bash
 make build      # Build release (MSVC target)
 make run        # Build and run
@@ -82,6 +96,16 @@ make kill       # Kill running instance
 make clean      # Clean build artifacts
 make folder     # Open recordings folder
 make rebuild    # Kill, rebuild, then run: make open
+```
+
+Cross-compiling from macOS (produces the same `x86_64-pc-windows-msvc` binary):
+
+```bash
+brew install rustup llvm lld
+rustup-init -y && rustup target add x86_64-pc-windows-msvc
+cargo install cargo-xwin
+export PATH="/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:$PATH"
+cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
 ### Tests

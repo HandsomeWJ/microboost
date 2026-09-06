@@ -53,9 +53,33 @@ mod profiles {
         PathBuf::from(base).join("Microboost").join("settings.json")
     }
 
-    #[derive(Serialize, Deserialize, Default)]
+    fn default_true() -> bool {
+        true
+    }
+
+    #[derive(Serialize, Deserialize, Clone)]
     pub struct Settings {
         pub last_input_device: Option<String>,
+        /// Start boosting immediately on launch (otherwise start in 1x passthrough)
+        #[serde(default = "default_true")]
+        pub auto_start_boost: bool,
+        /// Minimise / close hides the window to the system tray instead of quitting
+        #[serde(default = "default_true")]
+        pub minimize_to_tray: bool,
+        /// Launch with the window hidden (only meaningful with minimize_to_tray)
+        #[serde(default)]
+        pub start_in_tray: bool,
+    }
+
+    impl Default for Settings {
+        fn default() -> Self {
+            Self {
+                last_input_device: None,
+                auto_start_boost: true,
+                minimize_to_tray: true,
+                start_in_tray: false,
+            }
+        }
     }
 
     pub fn load_settings() -> Settings {
@@ -218,6 +242,266 @@ mod vbcable {
     }
 }
 
+/// System tray icon + minimise/close-to-tray.
+///
+/// Hiding is done at the Win32 level: we wrap the window procedure winit installed and
+/// swallow WM_CLOSE / SC_MINIMIZE, calling ShowWindow(SW_HIDE) instead. This works even
+/// when egui isn't painting (a hidden window gets no redraw events), which is why the
+/// tray handlers also talk to Win32 directly rather than going through egui commands.
+mod tray {
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWLP_WNDPROC,
+        SC_MINIMIZE, SW_HIDE, SW_RESTORE, WM_CLOSE, WM_SYSCOMMAND, WNDPROC,
+    };
+
+    static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+    static PREV_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+    static TO_TRAY_ENABLED: AtomicBool = AtomicBool::new(true);
+
+    fn main_hwnd() -> HWND {
+        HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut core::ffi::c_void)
+    }
+
+    pub fn set_enabled(enabled: bool) {
+        TO_TRAY_ENABLED.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn hide_window() {
+        if MAIN_HWND.load(Ordering::SeqCst) != 0 {
+            unsafe {
+                let _ = ShowWindow(main_hwnd(), SW_HIDE);
+            }
+        }
+    }
+
+    pub fn show_window() {
+        if MAIN_HWND.load(Ordering::SeqCst) != 0 {
+            unsafe {
+                let _ = ShowWindow(main_hwnd(), SW_RESTORE);
+                let _ = SetForegroundWindow(main_hwnd());
+            }
+        }
+    }
+
+    unsafe extern "system" fn wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if TO_TRAY_ENABLED.load(Ordering::SeqCst) {
+            let minimize = msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE;
+            if minimize || msg == WM_CLOSE {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return LRESULT(0);
+            }
+        }
+        // Option<fn> is pointer-sized with a null niche, so this round-trip is sound.
+        let prev: WNDPROC = std::mem::transmute(PREV_WNDPROC.load(Ordering::SeqCst));
+        CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+    }
+
+    /// Simple procedurally drawn microphone icon (RGBA).
+    fn make_icon(size: u32) -> Vec<u8> {
+        let mut px = vec![0u8; (size * size * 4) as usize];
+        let s = size as f32;
+        let put = |px: &mut Vec<u8>, x: u32, y: u32, a: f32| {
+            let i = ((y * size + x) * 4) as usize;
+            px[i] = 70;
+            px[i + 1] = 190;
+            px[i + 2] = 90;
+            px[i + 3] = (a.clamp(0.0, 1.0) * 255.0) as u8;
+        };
+        for y in 0..size {
+            for x in 0..size {
+                let fx = (x as f32 + 0.5) / s;
+                let fy = (y as f32 + 0.5) / s;
+                // Capsule: rounded rect centred at x=0.5, y in [0.12, 0.56], half-width 0.15
+                let cx = (fx - 0.5).abs();
+                let capsule = if fy >= 0.27 && fy <= 0.41 {
+                    cx <= 0.15
+                } else {
+                    let cy = if fy < 0.27 { 0.27 - fy } else { fy - 0.41 };
+                    (cx * cx + cy * cy).sqrt() <= 0.15
+                };
+                // Cradle: lower half of a ring centred at (0.5, 0.41), r 0.25, thickness 0.06
+                let dy = fy - 0.41;
+                let r = ((fx - 0.5).powi(2) + dy * dy).sqrt();
+                let cradle = dy >= 0.0 && (r - 0.25).abs() <= 0.045;
+                // Stem + base
+                let stem = cx <= 0.04 && fy > 0.66 && fy <= 0.82;
+                let base = cx <= 0.2 && fy > 0.82 && fy <= 0.9;
+                if capsule || cradle || stem || base {
+                    put(&mut px, x, y, 1.0);
+                }
+            }
+        }
+        px
+    }
+
+    /// Install the window-proc hook and create the tray icon. Returns None if anything
+    /// fails (the app then behaves like before: closing quits).
+    pub fn install(cc: &eframe::CreationContext<'_>) -> Option<TrayIcon> {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let hwnd_val = match cc.window_handle().ok()?.as_raw() {
+            RawWindowHandle::Win32(h) => h.hwnd.get(),
+            _ => return None,
+        };
+        MAIN_HWND.store(hwnd_val, Ordering::SeqCst);
+        unsafe {
+            let prev = SetWindowLongPtrW(
+                HWND(hwnd_val as *mut core::ffi::c_void),
+                GWLP_WNDPROC,
+                wndproc as usize as isize,
+            );
+            PREV_WNDPROC.store(prev, Ordering::SeqCst);
+        }
+
+        let show = MenuItem::with_id("show", "Show Microboost", true, None);
+        let quit = MenuItem::with_id("quit", "Quit", true, None);
+        let menu = Menu::with_items(&[&show, &PredefinedMenuItem::separator(), &quit]).ok()?;
+
+        MenuEvent::set_event_handler(Some(|e: MenuEvent| match e.id.0.as_str() {
+            "show" => show_window(),
+            // Everything is persisted on change; the audio streams die with the process.
+            "quit" => std::process::exit(0),
+            _ => {}
+        }));
+        TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = e
+            {
+                show_window();
+            }
+        }));
+
+        let icon = tray_icon::Icon::from_rgba(make_icon(32), 32, 32).ok()?;
+        TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .with_tooltip("Microboost — right-click for menu")
+            .with_icon(icon)
+            .build()
+            .ok()
+    }
+}
+
+/// "Launch with Windows" via HKCU\Software\Microsoft\Windows\CurrentVersion\Run.
+/// The registry is the source of truth; nothing is duplicated in settings.json.
+mod autostart {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+        HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ,
+    };
+
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const VALUE_NAME: &str = "Microboost";
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Quoted path of the running executable, as it should appear in the Run key.
+    fn command_line() -> Option<String> {
+        let exe = std::env::current_exe().ok()?;
+        Some(format!("\"{}\"", exe.display()))
+    }
+
+    fn open_key(access: REG_SAM_FLAGS) -> Option<HKEY> {
+        let sub = wide(RUN_KEY);
+        let mut key = HKEY::default();
+        let err = unsafe {
+            RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(sub.as_ptr()), 0, access, &mut key)
+        };
+        (err == ERROR_SUCCESS).then_some(key)
+    }
+
+    /// The command currently registered, if any.
+    pub fn current_value() -> Option<String> {
+        let key = open_key(KEY_READ)?;
+        let name = wide(VALUE_NAME);
+        let mut buf = vec![0u8; 4096];
+        let mut len = buf.len() as u32;
+        let err = unsafe {
+            RegQueryValueExW(
+                key,
+                PCWSTR(name.as_ptr()),
+                None,
+                None,
+                Some(buf.as_mut_ptr()),
+                Some(&mut len),
+            )
+        };
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        if err != ERROR_SUCCESS {
+            return None;
+        }
+        let u16s: Vec<u16> = buf[..len as usize]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&u16s))
+    }
+
+    pub fn is_enabled() -> bool {
+        current_value().is_some()
+    }
+
+    /// Register the current exe. Returns an error string for the status line on failure.
+    pub fn enable() -> Result<(), String> {
+        let cmd = command_line().ok_or("Could not determine exe path")?;
+        let key = open_key(KEY_SET_VALUE).ok_or("Could not open Run registry key")?;
+        let name = wide(VALUE_NAME);
+        let data = wide(&cmd);
+        let bytes: Vec<u8> = data.iter().flat_map(|c| c.to_le_bytes()).collect();
+        let err = unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(&bytes)) };
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        if err == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("Registry write failed (error {})", err.0))
+        }
+    }
+
+    pub fn disable() -> Result<(), String> {
+        let key = open_key(KEY_SET_VALUE).ok_or("Could not open Run registry key")?;
+        let name = wide(VALUE_NAME);
+        let err = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        if err == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("Registry delete failed (error {})", err.0))
+        }
+    }
+
+    /// If enabled but pointing at a different exe (e.g. a newer build was copied
+    /// elsewhere), re-point it at the exe that is actually running.
+    pub fn sync_path_if_enabled() {
+        if let (Some(current), Some(wanted)) = (current_value(), command_line()) {
+            if current != wanted {
+                let _ = enable();
+            }
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -230,7 +514,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Microboost",
         options,
-        Box::new(|_cc| Ok(Box::new(MicroboostApp::new()))),
+        Box::new(|cc| Ok(Box::new(MicroboostApp::new(cc)))),
     )
 }
 
@@ -262,6 +546,8 @@ const CALIBRATION_PHRASES: &[&str] = &[
 
 /// YouTube recommended voice target: ~-16 dBFS RMS (0.16 linear)
 const TARGET_RMS: f32 = 0.16;
+/// Maximum boost in percent (50x, ~+34 dB). Anything above ~5x will clip on peaks for a normal mic.
+const MAX_BOOST_PCT: u32 = 5000;
 
 
 struct MicroboostApp {
@@ -316,6 +602,14 @@ struct MicroboostApp {
 
     // Auto-start
     first_frame: bool,
+    frame_count: u32,
+
+    // Persisted app settings (auto-start, tray behaviour)
+    settings: profiles::Settings,
+    // Keeps the tray icon alive; None if creation failed
+    _tray: Option<tray_icon::TrayIcon>,
+    // Mirrors the HKCU Run registry entry
+    launch_with_windows: bool,
 
     // Noise gate
     noise_gate: Arc<Mutex<noise_gate::NoiseGate>>,
@@ -331,7 +625,7 @@ struct MicroboostApp {
 
 
 impl MicroboostApp {
-    fn new() -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let host = cpal::default_host();
         let (input_devices, output_devices) = Self::enumerate_devices(&host);
 
@@ -355,6 +649,11 @@ impl MicroboostApp {
                     })
             })
             .unwrap_or(0);
+
+        tray::set_enabled(settings.minimize_to_tray);
+        let tray = tray::install(cc);
+        autostart::sync_path_if_enabled();
+        let launch_with_windows = autostart::is_enabled();
 
         // Load saved boost for the selected device
         let current_profile = input_devices
@@ -421,6 +720,10 @@ impl MicroboostApp {
             device_profiles,
 
             first_frame: true,
+            frame_count: 0,
+            settings,
+            _tray: tray,
+            launch_with_windows,
 
             noise_gate: Arc::new(Mutex::new(ng)),
             ng_cal_state: noise_gate::new_calibration_state(),
@@ -788,9 +1091,8 @@ impl MicroboostApp {
                 },
             );
             profiles::save(&self.device_profiles);
-            profiles::save_settings(&profiles::Settings {
-                last_input_device: Some(name.clone()),
-            });
+            self.settings.last_input_device = Some(name.clone());
+            profiles::save_settings(&self.settings);
         }
     }
 
@@ -924,7 +1226,7 @@ impl MicroboostApp {
         // Calculate needed boost
         let needed = TARGET_RMS / raw_rms;
         let boost_pct = (needed * 100.0).round() as u32;
-        let boost_pct = boost_pct.clamp(10, 500);
+        let boost_pct = boost_pct.clamp(10, MAX_BOOST_PCT);
 
         let raw_db = 20.0 * raw_rms.log10();
         let boosted_rms = (raw_rms * boost_pct as f32 / 100.0).min(1.0);
@@ -1278,10 +1580,21 @@ impl eframe::App for MicroboostApp {
         // Poll setup thread
         self.check_setup_thread();
 
-        // Auto-start pipeline on first frame
+        // Auto-start pipeline on first frame (boosting, or 1x passthrough if disabled)
         if self.first_frame && self.setup_state == SetupState::Ready {
             self.first_frame = false;
             self.start_pipeline();
+            if !self.settings.auto_start_boost {
+                self.stop_pipeline();
+            }
+        }
+
+        // eframe shows the window after the first frame; hide it on the second if asked
+        self.frame_count = self.frame_count.saturating_add(1);
+        if self.frame_count == 1 {
+            ctx.request_repaint();
+        } else if self.frame_count == 2 && self.settings.minimize_to_tray && self.settings.start_in_tray {
+            tray::hide_window();
         }
 
         // Periodic device hot-plug detection
@@ -1476,14 +1789,14 @@ impl MicroboostApp {
 
         ui.add_space(8.0);
 
-        // Boost slider (capped at 500%, manual entry for higher)
-        let boost_presets = [10, 25, 50, 100, 150, 200, 300, 400, 500];
+        // Boost slider (up to MAX_BOOST_PCT)
+        let boost_presets = [10, 100, 200, 500, 1000, 2000, 3000, 4000, 5000];
         let prev_boost = self.boost;
         ui.horizontal(|ui| {
             ui.label("Boost:");
             let drag = ui.add(
                 egui::DragValue::new(&mut self.boost)
-                    .range(10..=1000)
+                    .range(10..=MAX_BOOST_PCT)
                     .speed(10)
                     .suffix("%"),
             );
@@ -1491,7 +1804,7 @@ impl MicroboostApp {
             if drag.changed() {
                 // Round to nearest 10
                 self.boost = ((self.boost + 5) / 10) * 10;
-                self.boost = self.boost.clamp(10, 1000);
+                self.boost = self.boost.clamp(10, MAX_BOOST_PCT);
             }
             if drag.lost_focus() && self.is_active && self.boost != prev_boost {
                 self.update_gain();
@@ -1500,13 +1813,13 @@ impl MicroboostApp {
 
         ui.add_space(4.0);
 
-        // Slider caps at 500%
-        let slider_val = self.boost.clamp(10, 500);
+        let slider_val = self.boost.clamp(10, MAX_BOOST_PCT);
         let mut slider_boost = slider_val;
         ui.push_id("boost_slider", |ui| {
             ui.spacing_mut().slider_width = 340.0;
             let resp = ui.add(
-                egui::Slider::new(&mut slider_boost, 10..=500)
+                egui::Slider::new(&mut slider_boost, 10..=MAX_BOOST_PCT)
+                    .logarithmic(true)
                     .show_value(false)
                     .step_by(10.0)
                     .trailing_fill(true),
@@ -1529,7 +1842,7 @@ impl MicroboostApp {
 
         ui.horizontal(|ui| {
             for &preset in &boost_presets {
-                let label = format!("{:.1}x", preset as f32 / 100.0);
+                let label = format!("{}x", preset as f32 / 100.0);
                 if ui
                     .selectable_label(self.boost == preset, &label)
                     .clicked()
@@ -1696,10 +2009,10 @@ impl MicroboostApp {
                             .color(egui::Color32::from_rgb(255, 200, 60)));
                     });
 
-                    if boost_val >= 500 {
+                    if boost_val >= MAX_BOOST_PCT {
                         ui.label(
                             egui::RichText::new(
-                                "Capped at 5x. Use manual entry above for higher values.",
+                                "Capped at 50x. Signal may clip — check with Record Test.",
                             )
                             .small()
                             .color(egui::Color32::from_rgb(180, 180, 120)),
@@ -2072,6 +2385,54 @@ impl MicroboostApp {
 
             if ui.button("Refresh Devices").clicked() {
                 self.refresh_devices();
+            }
+        });
+
+        ui.add_space(4.0);
+        ui.collapsing("Settings", |ui| {
+            let mut changed = false;
+            changed |= ui
+                .checkbox(&mut self.settings.auto_start_boost, "Auto-start boost on launch")
+                .changed();
+            if ui
+                .checkbox(
+                    &mut self.settings.minimize_to_tray,
+                    "Minimise / close to tray (keeps boosting in background)",
+                )
+                .changed()
+            {
+                changed = true;
+                tray::set_enabled(self.settings.minimize_to_tray);
+            }
+            ui.add_enabled_ui(self.settings.minimize_to_tray, |ui| {
+                changed |= ui
+                    .checkbox(&mut self.settings.start_in_tray, "Start hidden in tray")
+                    .changed();
+            });
+            if ui
+                .checkbox(&mut self.launch_with_windows, "Launch with Windows")
+                .on_hover_text("Adds/removes this exe in HKCU\\...\\CurrentVersion\\Run")
+                .changed()
+            {
+                let result = if self.launch_with_windows {
+                    autostart::enable()
+                } else {
+                    autostart::disable()
+                };
+                if let Err(e) = result {
+                    self.launch_with_windows = autostart::is_enabled();
+                    *self.status.lock().unwrap() = e;
+                }
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Quit from the tray icon's right-click menu. Left-click the icon to reopen.",
+                )
+                .small()
+                .color(egui::Color32::from_rgb(140, 140, 150)),
+            );
+            if changed {
+                profiles::save_settings(&self.settings);
             }
         });
 
