@@ -1,3 +1,4 @@
+pub mod echo;
 pub mod noise_gate;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

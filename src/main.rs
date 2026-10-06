@@ -2,7 +2,7 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
-use microboost::{noise_gate, SpscRing, RING_SIZE};
+use microboost::{echo, noise_gate, SpscRing, RING_SIZE};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -57,6 +57,10 @@ mod profiles {
         true
     }
 
+    fn default_echo_strength() -> u32 {
+        40
+    }
+
     #[derive(Serialize, Deserialize, Clone)]
     pub struct Settings {
         pub last_input_device: Option<String>,
@@ -69,6 +73,15 @@ mod profiles {
         /// Launch with the window hidden (only meaningful with minimize_to_tray)
         #[serde(default)]
         pub start_in_tray: bool,
+        /// Remove the PC's own playback (speakers) from the mic
+        #[serde(default = "default_true")]
+        pub echo_suppress: bool,
+        /// Adaptive cancellation (talk over media) vs. plain mute-while-playing
+        #[serde(default = "default_true")]
+        pub echo_adaptive: bool,
+        /// Maximum attenuation applied while the speakers play, in dB
+        #[serde(default = "default_echo_strength")]
+        pub echo_strength_db: u32,
     }
 
     impl Default for Settings {
@@ -78,6 +91,9 @@ mod profiles {
                 auto_start_boost: true,
                 minimize_to_tray: true,
                 start_in_tray: false,
+                echo_suppress: true,
+                echo_adaptive: true,
+                echo_strength_db: 40,
             }
         }
     }
@@ -505,7 +521,7 @@ mod autostart {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 740.0])
+            .with_inner_size([420.0, 860.0])
             .with_resizable(false)
             .with_title("Microboost"),
         ..Default::default()
@@ -611,6 +627,12 @@ struct MicroboostApp {
     // Mirrors the HKCU Run registry entry
     launch_with_windows: bool,
 
+    // Speaker echo suppression
+    echo_shared: Arc<echo::Shared>,
+    ref_ring: Arc<SpscRing>,
+    loopback_stream: Arc<Mutex<Option<cpal::Stream>>>,
+    loopback_note: String,
+
     // Noise gate
     noise_gate: Arc<Mutex<noise_gate::NoiseGate>>,
     ng_cal_state: Arc<Mutex<noise_gate::CalibrationState>>,
@@ -654,6 +676,10 @@ impl MicroboostApp {
         let tray = tray::install(cc);
         autostart::sync_path_if_enabled();
         let launch_with_windows = autostart::is_enabled();
+        let echo_shared = Arc::new(echo::Shared::new(
+            settings.echo_adaptive,
+            settings.echo_strength_db as f32,
+        ));
 
         // Load saved boost for the selected device
         let current_profile = input_devices
@@ -724,6 +750,10 @@ impl MicroboostApp {
             settings,
             _tray: tray,
             launch_with_windows,
+            echo_shared,
+            ref_ring: Arc::new(SpscRing::new(RING_SIZE)),
+            loopback_stream: Arc::new(Mutex::new(None)),
+            loopback_note: String::new(),
 
             noise_gate: Arc::new(Mutex::new(ng)),
             ng_cal_state: noise_gate::new_calibration_state(),
@@ -755,6 +785,69 @@ impl MicroboostApp {
     }
 
     /// Find an input device by name (avoids index mismatch when CABLE is filtered from UI)
+    /// Capture what Windows is playing on the default output device (WASAPI
+    /// loopback — cpal enables it when an output device is opened for input),
+    /// downmix to mono, resample to the mic rate and feed the reference ring.
+    fn build_loopback(
+        host: &cpal::Host,
+        mic_rate: u32,
+        ring: Arc<SpscRing>,
+        active: Arc<Mutex<bool>>,
+    ) -> Result<cpal::Stream, String> {
+        fn err_fn(e: cpal::StreamError) {
+            eprintln!("Loopback error: {}", e);
+        }
+        let dev = host
+            .default_output_device()
+            .ok_or_else(|| "no default output device".to_string())?;
+        let name = dev.name().unwrap_or_default();
+        let cfg = dev
+            .default_output_config()
+            .map_err(|e| format!("{} ({})", e, name))?;
+        let channels = cfg.channels() as usize;
+        let rate = cfg.sample_rate().0;
+        let format = cfg.sample_format();
+        let stream_cfg: cpal::StreamConfig = cfg.into();
+        ring.reset();
+        let mut rs = echo::LinearResampler::new(rate, mic_rate);
+        let stream = match format {
+            cpal::SampleFormat::F32 => dev.build_input_stream(
+                &stream_cfg,
+                move |data: &[f32], _| {
+                    if !*active.lock().unwrap() {
+                        return;
+                    }
+                    for frame in data.chunks(channels) {
+                        let mono = frame.iter().sum::<f32>() / channels as f32;
+                        rs.push(mono, |s| ring.push(s));
+                    }
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::I16 => dev.build_input_stream(
+                &stream_cfg,
+                move |data: &[i16], _| {
+                    if !*active.lock().unwrap() {
+                        return;
+                    }
+                    for frame in data.chunks(channels) {
+                        let mono = frame.iter().map(|&v| v as f32 / 32768.0).sum::<f32>()
+                            / channels as f32;
+                        rs.push(mono, |s| ring.push(s));
+                    }
+                },
+                err_fn,
+                None,
+            ),
+            other => return Err(format!("unsupported sample format {:?} on {}", other, name)),
+        }
+        .map_err(|e| format!("{} ({})", e, name))?;
+        stream.play().map_err(|e| format!("{} ({})", e, name))?;
+        eprintln!("Loopback: {} {}Hz {}ch -> {}Hz mono", name, rate, channels, mic_rate);
+        Ok(stream)
+    }
+
     fn find_input_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
         host.input_devices().ok()?.find(|d| d.name().ok().as_deref() == Some(name))
     }
@@ -959,6 +1052,29 @@ impl MicroboostApp {
         // Set gain to current boost level
         *self.live_gain.lock().unwrap() = self.boost as f32 / 100.0;
 
+        // Speaker reference (loopback) for echo suppression
+        let mut loopback_stream: Option<cpal::Stream> = None;
+        self.loopback_note.clear();
+        if self.settings.echo_suppress {
+            match Self::build_loopback(
+                &self.host,
+                in_sample_rate.0,
+                self.ref_ring.clone(),
+                self.pipeline_active.clone(),
+            ) {
+                Ok(s) => loopback_stream = Some(s),
+                Err(e) => self.loopback_note = e,
+            }
+        }
+        let use_ref = loopback_stream.is_some();
+        let ref_ring = self.ref_ring.clone();
+        let echo_shared = self.echo_shared.clone();
+        let mut aec = echo::EchoCanceller::new(in_sample_rate.0);
+        // Keep the reference ring shallow so the popped sample is recent; the
+        // canceller looks back into its own history for the actual echo delay.
+        let max_fill = (in_sample_rate.0 / 10) as usize; // 100 ms
+        let target_fill = (in_sample_rate.0 / 50) as usize; // 20 ms
+
         let in_stream_config: cpal::StreamConfig = in_config.into();
         let input_stream = input_device.build_input_stream(
             &in_stream_config,
@@ -968,18 +1084,43 @@ impl MicroboostApp {
                 }
                 let gain = *gain_shared.lock().unwrap();
                 let mut gate = ng.lock().unwrap();
+                if use_ref {
+                    aec.set_params(
+                        echo_shared.adaptive.load(Ordering::Relaxed),
+                        echo::Shared::get_f32(&echo_shared.strength_db),
+                    );
+                    let avail = ref_ring.available();
+                    if avail > max_fill {
+                        ref_ring.advance(avail - target_fill);
+                    }
+                }
                 let mut sum_raw = 0.0f32;
                 let mut sum_out = 0.0f32;
                 let mut count = 0usize;
                 for chunk in data.chunks(in_channels) {
                     let mono = chunk[0];
-                    let boosted = (mono * gain).clamp(-1.0, 1.0);
+                    let clean = if use_ref {
+                        let r = if ref_ring.available() > 0 {
+                            let s = ref_ring.peek(0);
+                            ref_ring.advance(1);
+                            s
+                        } else {
+                            0.0 // speakers idle: WASAPI loopback delivers nothing
+                        };
+                        aec.process(mono, r)
+                    } else {
+                        mono
+                    };
+                    let boosted = (clean * gain).clamp(-1.0, 1.0);
                     // Apply noise gate after boost
                     let gated = gate.process(boosted);
                     ring.push(gated);
                     sum_raw += mono * mono;
                     sum_out += gated * gated;
                     count += 1;
+                }
+                if use_ref {
+                    aec.publish(&echo_shared);
                 }
                 if count > 0 {
                     let raw = (sum_raw / count as f32).sqrt();
@@ -1027,6 +1168,7 @@ impl MicroboostApp {
                 if is.play().is_ok() && os.play().is_ok() {
                     *self.input_stream.lock().unwrap() = Some(is);
                     *self.output_stream.lock().unwrap() = Some(os);
+                    *self.loopback_stream.lock().unwrap() = loopback_stream;
                     self.is_active = true;
                     let out_name = self
                         .output_devices
@@ -1067,6 +1209,7 @@ impl MicroboostApp {
         *self.pipeline_active.lock().unwrap() = false;
         *self.input_stream.lock().unwrap() = None;
         *self.output_stream.lock().unwrap() = None;
+        *self.loopback_stream.lock().unwrap() = None;
         self.is_active = false;
         *self.status.lock().unwrap() = "Stopped".to_string();
     }
@@ -2387,6 +2530,100 @@ impl MicroboostApp {
                 self.refresh_devices();
             }
         });
+
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new("Speaker echo suppression")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut restart = false;
+                if ui
+                    .checkbox(
+                        &mut self.settings.echo_suppress,
+                        "Remove my speakers' audio from the mic",
+                    )
+                    .on_hover_text(
+                        "Captures what Windows is playing (podcasts, videos, call audio) \
+                         and cancels or ducks it out of the mic. Adds ~5 ms latency.",
+                    )
+                    .changed()
+                {
+                    restart = true;
+                }
+                ui.add_enabled_ui(self.settings.echo_suppress, |ui| {
+                    if ui
+                        .checkbox(
+                            &mut self.settings.echo_adaptive,
+                            "Adaptive cancellation (talk over media)",
+                        )
+                        .on_hover_text(
+                            "On: subtracts the speaker audio and only ducks the leftover, so you \
+                             can talk while something plays. Off: mutes the mic by the strength \
+                             below whenever the speakers are playing.",
+                        )
+                        .changed()
+                    {
+                        self.echo_shared
+                            .adaptive
+                            .store(self.settings.echo_adaptive, Ordering::Relaxed);
+                        profiles::save_settings(&self.settings);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Strength:");
+                        let r = ui.add(
+                            egui::Slider::new(&mut self.settings.echo_strength_db, 6..=60)
+                                .suffix(" dB"),
+                        );
+                        if r.changed() {
+                            echo::Shared::set_f32(
+                                &self.echo_shared.strength_db,
+                                self.settings.echo_strength_db as f32,
+                            );
+                        }
+                        if r.drag_stopped() || r.lost_focus() {
+                            profiles::save_settings(&self.settings);
+                        }
+                    });
+                });
+                let status = if !self.settings.echo_suppress {
+                    "Off".to_string()
+                } else if !self.loopback_note.is_empty() {
+                    format!("Could not capture speaker output: {}", self.loopback_note)
+                } else if !*self.pipeline_active.lock().unwrap() {
+                    "Waiting for pipeline".to_string()
+                } else {
+                    let s = &self.echo_shared;
+                    if !s.ref_active.load(Ordering::Relaxed) {
+                        "Speakers: silent".to_string()
+                    } else {
+                        let erle = echo::Shared::get_f32(&s.erle_db);
+                        let duck = echo::Shared::get_f32(&s.duck_db);
+                        if !self.settings.echo_adaptive {
+                            format!("Speakers: playing · ducking {:.0} dB", duck)
+                        } else if s.echo_detected.load(Ordering::Relaxed) {
+                            format!(
+                                "Speakers: playing · echo in mic · cancelling {:.0} dB · ducking {:.0} dB",
+                                erle, duck
+                            )
+                        } else {
+                            "Speakers: playing · no echo detected in mic".to_string()
+                        }
+                    }
+                };
+                ui.label(
+                    egui::RichText::new(status)
+                        .small()
+                        .color(egui::Color32::from_rgb(140, 140, 150)),
+                );
+                if restart {
+                    profiles::save_settings(&self.settings);
+                    let was_active = self.is_active;
+                    self.kill_pipeline();
+                    self.start_pipeline();
+                    if !was_active {
+                        self.stop_pipeline();
+                    }
+                }
+            });
 
         ui.add_space(4.0);
         ui.collapsing("Settings", |ui| {

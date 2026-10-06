@@ -7,6 +7,7 @@
 > - Boost cap raised from 5x to 50x (logarithmic slider, auto-calibrate can recommend up to 50x)
 > - System tray: minimise/close hides to the tray and keeps boosting; left-click reopens, right-click for Quit
 > - Settings section: auto-start boost, start hidden in tray, launch with Windows (per-user Run key)
+> - Speaker echo suppression: cancels/ducks whatever the PC is playing out of the mic (see below)
 > - Cross-compiling from macOS via `cargo-xwin` (see Development)
 
 A Windows microphone booster that amplifies your mic for other apps (Discord, Teams, etc.) using a real-time audio pipeline through [VB-CABLE](https://vb-audio.com/Cable/) — a free virtual audio cable driver that creates a pair of connected audio devices (one for input, one for output) so audio can be routed between applications.
@@ -45,9 +46,32 @@ On first launch, the app will offer to download and install VB-CABLE (free) auto
 - System tray: minimise/close hides to the tray and keeps boosting; optional start-hidden
 - Auto-start boost on launch (toggle in Settings)
 - Launch with Windows (toggle in Settings; uses the per-user Run registry key)
+- Speaker echo suppression: removes the PC's own playback (podcasts, videos, call audio) from the mic
 - Test recording and playback to verify your levels
 - Lock-free audio pipeline (96.7 dB SNR)
 - Native UI built with egui
+
+## Speaker echo suppression
+
+At high boost the mic also picks up whatever the speakers are playing. Microboost
+captures the speaker mix via WASAPI loopback and uses it as a reference:
+
+```
+speakers ──► loopback copy ──► adaptive filter ──► estimated echo
+mic ──────────────────────────► minus estimated echo ──► duck leftover ──► boost ──► VB-CABLE
+```
+
+- **Adaptive cancellation** (default): a partitioned frequency-domain adaptive filter
+  learns the speaker→mic path (delay up to 1 s, 85 ms window) and subtracts the echo,
+  then ducks the leftover by `strength − cancelled dB`. You can talk while something
+  plays. Ducking only engages when echo is actually detected in the mic, so headphone
+  users are left alone.
+- **Adaptive off**: the mic is simply attenuated by `strength` whenever the speakers
+  are playing. Predictable, but you are muted while media plays.
+- The stage adds one block (~5 ms) of latency. Status is shown live in the section:
+  whether the speakers are playing, whether echo is detected, how much is being
+  cancelled and how much is being ducked.
+- It cannot remove a *person* in the room: only sound the PC itself is playing.
 
 ## Installation
 
@@ -117,6 +141,7 @@ cargo test --release --target x86_64-pc-windows-msvc
 ```
 
 Tests include:
+- `src/echo.rs` unit tests — synthetic echo paths through the canceller: convergence, 150 ms delay relocation, double-talk, headphones (no echo), ducking. Pure DSP, so they run on any OS with `cargo test --release --lib echo`
 - `passthrough_test` — verifies 1x boost is identity, 2x doubles signal, noise gate works, sample rate conversion is correct
 - `cable_loopback` — sends a sine wave through VB-CABLE and measures distortion (requires VB-CABLE installed)
 - `deep_compare` — sample-level cross-correlation comparison of pipeline output vs original (SNR, alignment)
