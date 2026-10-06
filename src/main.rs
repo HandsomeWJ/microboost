@@ -82,6 +82,9 @@ mod profiles {
         /// Maximum attenuation applied while the speakers play, in dB
         #[serde(default = "default_echo_strength")]
         pub echo_strength_db: u32,
+        /// Output device to capture as the echo reference; None = Windows default
+        #[serde(default)]
+        pub echo_ref_device: Option<String>,
     }
 
     impl Default for Settings {
@@ -94,6 +97,7 @@ mod profiles {
                 echo_suppress: true,
                 echo_adaptive: true,
                 echo_strength_db: 50,
+                echo_ref_device: None,
             }
         }
     }
@@ -635,6 +639,9 @@ struct MicroboostApp {
     loopback_stream: Arc<Mutex<Option<cpal::Stream>>>,
     loopback_note: String,
     loopback_desc: String,
+    // Name of the output device the loopback currently captures
+    loopback_name: String,
+    ref_silent_since: Option<std::time::Instant>,
     // 10 s echo diagnostic recording: (raw mic, aligned reference) pairs
     diag_rec: Arc<Mutex<Option<Vec<(f32, f32)>>>>,
     diag_cap: usize,
@@ -764,6 +771,8 @@ impl MicroboostApp {
             loopback_stream: Arc::new(Mutex::new(None)),
             loopback_note: String::new(),
             loopback_desc: String::new(),
+            loopback_name: String::new(),
+            ref_silent_since: None,
             diag_rec: Arc::new(Mutex::new(None)),
             diag_cap: 0,
             diag_rate: 48000,
@@ -802,19 +811,31 @@ impl MicroboostApp {
     /// Capture what Windows is playing on the default output device (WASAPI
     /// loopback — cpal enables it when an output device is opened for input),
     /// downmix to mono, resample to the mic rate and feed the reference ring.
+    /// Returns the stream, a description for the diagnostics line, and the
+    /// name of the device actually captured.
     fn build_loopback(
         host: &cpal::Host,
         mic_rate: u32,
         ring: Arc<RefRing>,
         anchor: Arc<Mutex<Option<(cpal::StreamInstant, u64)>>>,
         active: Arc<Mutex<bool>>,
-    ) -> Result<(cpal::Stream, String), String> {
+        wanted: Option<&str>,
+    ) -> Result<(cpal::Stream, String, String), String> {
         fn err_fn(e: cpal::StreamError) {
             eprintln!("Loopback error: {}", e);
         }
-        let dev = host
-            .default_output_device()
-            .ok_or_else(|| "no default output device".to_string())?;
+        // The chosen output device, else whatever Windows currently routes to.
+        let chosen = wanted.and_then(|w| {
+            host.output_devices()
+                .ok()?
+                .find(|d| d.name().ok().as_deref() == Some(w))
+        });
+        let dev = match chosen {
+            Some(d) => d,
+            None => host
+                .default_output_device()
+                .ok_or_else(|| "no default output device".to_string())?,
+        };
         let name = dev.name().unwrap_or_default();
         let cfg = dev
             .default_output_config()
@@ -868,7 +889,7 @@ impl MicroboostApp {
         stream.play().map_err(|e| format!("{} ({})", e, name))?;
         let desc = format!("{} {}Hz/{}ch {:?} → {}Hz", name, rate, channels, format, mic_rate);
         eprintln!("Loopback: {}", desc);
-        Ok((stream, desc))
+        Ok((stream, desc, name))
     }
 
     fn finish_diag_recording(&mut self) {
@@ -932,6 +953,29 @@ impl MicroboostApp {
             return;
         }
         self.last_device_check = std::time::Instant::now();
+
+        // Following the Windows default output: restart when it moves (for
+        // example the Realtek "Speakers" / "Headphones" endpoints swapping).
+        if self.settings.echo_suppress
+            && self.settings.echo_ref_device.is_none()
+            && *self.pipeline_active.lock().unwrap()
+            && self.loopback_stream.lock().unwrap().is_some()
+        {
+            let current = self
+                .host
+                .default_output_device()
+                .and_then(|d| d.name().ok())
+                .unwrap_or_default();
+            if !current.is_empty() && current != self.loopback_name {
+                let was_active = self.is_active;
+                self.kill_pipeline();
+                self.start_pipeline();
+                if !was_active {
+                    self.stop_pipeline();
+                }
+                return;
+            }
+        }
 
         let old_devices = self.input_devices.clone();
         let current_name = self.input_devices.get(self.selected_input).cloned();
@@ -1118,13 +1162,16 @@ impl MicroboostApp {
                 self.ref_ring.clone(),
                 self.ref_anchor.clone(),
                 self.pipeline_active.clone(),
+                self.settings.echo_ref_device.as_deref(),
             ) {
-                Ok((s, desc)) => {
+                Ok((s, desc, name)) => {
                     loopback_stream = Some(s);
                     self.loopback_desc = desc;
+                    self.loopback_name = name;
                 }
                 Err(e) => self.loopback_note = e,
             }
+            self.ref_silent_since = None;
         }
         let use_ref = loopback_stream.is_some();
         let ref_ring = self.ref_ring.clone();
@@ -2680,6 +2727,54 @@ impl MicroboostApp {
                     restart = true;
                 }
                 ui.add_enabled_ui(self.settings.echo_suppress, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Reference:")
+                            .on_hover_text("The output device whose audio the mic picks up.");
+                        let default_name = self
+                            .host
+                            .default_output_device()
+                            .and_then(|d| d.name().ok())
+                            .unwrap_or_default();
+                        let selected = match &self.settings.echo_ref_device {
+                            Some(n) => n.clone(),
+                            None => format!("Windows default ({})", default_name),
+                        };
+                        let mut choice: Option<Option<String>> = None;
+                        egui::ComboBox::from_id_salt("echo_ref_device")
+                            .width(300.0)
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.settings.echo_ref_device.is_none(),
+                                        format!("Windows default ({})", default_name),
+                                    )
+                                    .clicked()
+                                {
+                                    choice = Some(None);
+                                }
+                                for name in &self.output_devices {
+                                    if name.to_lowercase().contains("cable input") {
+                                        continue; // our own output: would cancel the user
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            self.settings.echo_ref_device.as_deref() == Some(name),
+                                            name,
+                                        )
+                                        .clicked()
+                                    {
+                                        choice = Some(Some(name.clone()));
+                                    }
+                                }
+                            });
+                        if let Some(c) = choice {
+                            if c != self.settings.echo_ref_device {
+                                self.settings.echo_ref_device = c;
+                                restart = true;
+                            }
+                        }
+                    });
                     if ui
                         .checkbox(
                             &mut self.settings.echo_adaptive,
@@ -2757,6 +2852,28 @@ impl MicroboostApp {
                         .color(egui::Color32::from_rgb(140, 140, 150)),
                 );
                 if self.settings.echo_suppress && self.loopback_note.is_empty() {
+                    // Reference silent while the mic clearly hears something:
+                    // almost always the wrong output device being captured.
+                    let ref_active = self.echo_shared.ref_active.load(Ordering::Relaxed);
+                    let mic_loud = *self.live_input_rms.lock().unwrap() > 0.004;
+                    if *self.pipeline_active.lock().unwrap() && !ref_active && mic_loud {
+                        if self.ref_silent_since.is_none() {
+                            self.ref_silent_since = Some(std::time::Instant::now());
+                        }
+                    } else {
+                        self.ref_silent_since = None;
+                    }
+                    if self.ref_silent_since.map(|t| t.elapsed().as_secs() >= 3).unwrap_or(false) {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Nothing is playing on \"{}\" but the mic hears sound. If a video is \
+                                 playing, pick the output device it uses as Reference above.",
+                                self.loopback_name
+                            ))
+                            .small()
+                            .color(egui::Color32::from_rgb(230, 180, 80)),
+                        );
+                    }
                     let s = &self.echo_shared;
                     let diag = format!(
                         "{} · corr {:.2} · lag {:+.0} ms · window {:.0}..{:.0} ms · ERLE max {:.0}/typ {:.0} dB · ref {:+.0} ms · missing {:.0}%",

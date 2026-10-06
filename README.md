@@ -75,6 +75,11 @@ mic ─────────────────────────�
   engages when echo is actually detected in the mic, so headphone users are left alone.
 - **Adaptive off**: the mic is simply attenuated by `strength` whenever the speakers
   are playing. Predictable, but you are muted while media plays.
+- The reference is captured from the Windows default output device unless you pick another
+  one under **Reference** (Realtek drivers expose separate "Speakers" and "Headphones"
+  endpoints, and a video may play on one while the other is the default). When following
+  the default, a change of default restarts the capture; if the reference stays silent
+  while the mic hears sound, the UI says so.
 - The reference is aligned to the mic by capture timestamps (both WASAPI streams stamp
   their buffers from the same performance counter), with the reference read 15 ms
   earlier than the mic so the echo always lags it. Clock drift between mic and sound
