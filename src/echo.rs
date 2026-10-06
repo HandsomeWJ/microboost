@@ -41,7 +41,10 @@
 //!   price is mild thinning of the user's voice in bins the echo also occupies
 //!   while media plays; their level is otherwise untouched. A speech-band
 //!   near-end detector (error power vs. predicted residual and noise floor,
-//!   300 Hz up) gates the ERLE statistics and drives the status line.
+//!   300 Hz up, deliberately sensitive) switches the suppressor to a gentle
+//!   prediction (factor ÷ 8) and caps every bin at −12 dB while the user is
+//!   heard, with a 0.5 s hangover, so their voice is thinned at worst, never
+//!   removed. It also gates the ERLE statistics and drives the status line.
 //!   Suppression never engages unless echo is detected in the mic, so headphone
 //!   users are untouched. Simple mode: broadband attenuation by `strength`
 //!   whenever the speakers are playing.
@@ -83,8 +86,14 @@ const ERLE_DECAY_DB: f32 = 0.005;
 /// How long the speakers count as "playing" after the last audible sample.
 const REF_HOLD_SEC: f32 = 0.3;
 /// Error power this many times above the predicted residual (speech band
-/// only, see NEAR_MIN_HZ) means the near end (the user) is talking.
-const NEAR_RATIO: f32 = 4.0;
+/// only, see NEAR_MIN_HZ) means the near end (the user) is talking. Low on
+/// purpose: a false "talking" only costs some suppression, a miss costs the
+/// user's voice.
+const NEAR_RATIO: f32 = 2.0;
+/// While the user is detected, the over-prediction factor is divided by this
+/// and no bin is cut deeper than NEAR_FLOOR_DB.
+const NEAR_DIV: f32 = 8.0;
+const NEAR_FLOOR_DB: f32 = 12.0;
 /// The near-end decision ignores bins below this: mics pick up speaker bass
 /// through desks and walls with ±5 dB of scatter, while the user's voice
 /// stands out clearly in the speech band. 0 % false alarms on a real room.
@@ -101,8 +110,9 @@ const ERLE_LOW_ALPHA_DOWN: f32 = 0.1;
 const ERLE_LOW_ALPHA_UP: f32 = 0.01;
 /// Upward drift of the error-floor tracker (minimum statistics): ≈2.6 dB/s.
 const FLOOR_RISE: f32 = 1.003;
-/// Hangover after the last near-end block before ducking may resume.
-const NEAR_HOLD_SEC: f32 = 0.3;
+/// Hangover after the last near-end block before full suppression resumes;
+/// covers pauses between words so onsets are not cut.
+const NEAR_HOLD_SEC: f32 = 0.5;
 /// Residual suppressor: over-subtraction of the predicted residual.
 const SUP_OVERSUB: f32 = 2.0;
 /// Residual suppressor: upward drift of the minimum-statistics ratios per
@@ -119,7 +129,7 @@ const SUP_SLOW_ALPHA: f32 = 0.15;
 const SUP_BIAS_MIN: f32 = 0.5;
 const SUP_BIAS_MAX: f32 = 20.0;
 /// Residual suppressor: gain smoothing toward 1 (voice onset) and toward the floor.
-const SUP_GAIN_UP: f32 = 0.7;
+const SUP_GAIN_UP: f32 = 0.85;
 const SUP_GAIN_DOWN: f32 = 0.3;
 /// ERLE decay while the near end talks (≈0.25 dB/s): self-corrects at the
 /// next pause, bounded so a stale estimate cannot suppress ducking forever.
@@ -451,6 +461,7 @@ pub struct EchoCanceller {
     tune_near_ratio: f32,
     tune_near_min_bin: usize,
     tune_near_div: f32,
+    tune_near_floor_db: f32,
     near_hold: usize,
     near_hold_blocks: usize,
     near_present: bool,
@@ -556,10 +567,11 @@ impl EchoCanceller {
             sup_floor: 1.0,
             tune_factor: SUP_FACTOR_AT_40,
             tune_use_bias: false,
-            tune_mode_switch: false,
+            tune_mode_switch: true,
             tune_near_ratio: NEAR_RATIO,
             tune_near_min_bin: ((NEAR_MIN_HZ * n as f32 / sr as f32) as usize).min(b),
-            tune_near_div: 1.0,
+            tune_near_div: NEAR_DIV,
+            tune_near_floor_db: NEAR_FLOOR_DB,
             near_hold: 0,
             near_hold_blocks: ((NEAR_HOLD_SEC * srf) as usize / b).max(1),
             near_present: false,
@@ -612,6 +624,12 @@ impl EchoCanceller {
     /// While the near end is detected, the over-prediction factor is divided by this.
     pub fn set_near_divisor(&mut self, div: f32) {
         self.tune_near_div = div.max(1.0);
+    }
+
+    /// While the near end is detected, no bin is attenuated by more than this
+    /// (dB); 0 disables the cap. Guarantees the user stays audible.
+    pub fn set_near_floor_db(&mut self, db: f32) {
+        self.tune_near_floor_db = db.max(0.0);
     }
 
     /// Near-end detector tuning: ratio threshold and the lowest frequency (Hz)
@@ -999,7 +1017,7 @@ impl EchoCanceller {
         if !self.near_present {
             self.sup_floor = se_sum.min(self.sup_floor * FLOOR_RISE).max(1e-20);
         }
-        if active && se_sum > self.tune_near_ratio * (self.sup_bias * r_sum).max(self.sup_floor) {
+        if active && se_sum > self.tune_near_ratio * r_sum.max(self.sup_floor) {
             self.near_hold = self.near_hold_blocks;
         } else {
             self.near_hold = self.near_hold.saturating_sub(1);
@@ -1009,19 +1027,25 @@ impl EchoCanceller {
         // Wiener gain per bin. Nobody talking: scale the prediction up so bins
         // with echo in them go to the floor; the user talking: unbiased
         // prediction, so bins their voice dominates stay near 1.
+        let near_mode = self.tune_mode_switch && self.near_present;
         let factor = (if self.tune_use_bias { self.sup_bias } else { 1.0 })
-            * if self.tune_mode_switch && self.near_present {
+            * if near_mode {
                 (self.tune_factor / self.tune_near_div).max(1.0)
             } else {
                 self.tune_factor
             };
+        let gmin_now = if near_mode && self.tune_near_floor_db > 0.0 {
+            gmin.max(10f32.powf(-self.tune_near_floor_db / 20.0))
+        } else {
+            gmin
+        };
         for k in 0..=b {
             let g = if !active {
                 1.0
             } else {
                 let r = factor * self.sup_r[k];
                 let near = (self.sup_se[k] - r).max(0.0);
-                (near / (near + SUP_OVERSUB * r + 1e-30)).max(gmin)
+                (near / (near + SUP_OVERSUB * r + 1e-30)).max(gmin_now)
             };
             let a = if g > self.sup_gain[k] { SUP_GAIN_UP } else { SUP_GAIN_DOWN };
             self.sup_gain[k] += a * (g - self.sup_gain[k]);
@@ -1562,10 +1586,11 @@ mod tests {
         aec.set_params(true, strength);
         let envf = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
         if std::env::var("ECHO_DIAG_FACTOR").is_ok() {
-            aec.set_tuning(envf("ECHO_DIAG_FACTOR", SUP_FACTOR_AT_40), envf("ECHO_DIAG_BIAS", 0.0) > 0.5, envf("ECHO_DIAG_SWITCH", 0.0) > 0.5);
+            aec.set_tuning(envf("ECHO_DIAG_FACTOR", SUP_FACTOR_AT_40), envf("ECHO_DIAG_BIAS", 0.0) > 0.5, envf("ECHO_DIAG_SWITCH", 1.0) > 0.5);
         }
         aec.set_near_tuning(envf("ECHO_DIAG_NEAR_RATIO", NEAR_RATIO), envf("ECHO_DIAG_NEAR_MINHZ", NEAR_MIN_HZ));
-        aec.set_near_divisor(envf("ECHO_DIAG_NEAR_DIV", 1.0));
+        aec.set_near_divisor(envf("ECHO_DIAG_NEAR_DIV", NEAR_DIV));
+        aec.set_near_floor_db(envf("ECHO_DIAG_NEAR_FLOOR", NEAR_FLOOR_DB));
         let lat = aec.latency();
         let mut out_all = vec![0.0f32; n];
         let mut out_echo = vec![0.0f32; n];

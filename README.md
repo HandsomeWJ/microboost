@@ -69,6 +69,9 @@ mic ─────────────────────────�
   reduced even while you talk, and your voice level is not changed; the cost is a slightly
   thinner voice in bands the echo also occupies while media plays. Strength sets how hard
   the leftover is pushed down (16× over-prediction at 40 dB, doubling every 10 dB).
+  While the speech-band talk detector hears you, the suppressor switches to a gentle
+  prediction and never cuts any band by more than 12 dB, so your voice is thinned at
+  worst, never removed; it holds for 0.5 s after you stop so word onsets are not clipped.
   The leftover estimate is learned with minimum statistics, so talking cannot poison it,
   and it keeps working when the linear canceller cancels little (mics often pick speakers
   up as desk-borne bass that is only partly coherent with the signal). Suppression only
