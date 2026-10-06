@@ -62,15 +62,17 @@ mic ─────────────────────────�
 ```
 
 - **Adaptive cancellation** (default): a partitioned frequency-domain adaptive filter
-  learns the speaker→mic path (delay up to 1 s, 85 ms window) and subtracts the echo,
-  then ducks the leftover by `strength − cancelled dB`. You can talk while something
-  plays. Ducking only engages when echo is actually detected in the mic, so headphone
-  users are left alone.
+  learns the speaker→mic path (delay up to 1 s, 85 ms window) and subtracts the echo.
+  The leftover is ducked by `strength − cancelled dB`, but only while the mic holds
+  nothing but that leftover: as soon as your own voice is louder than the predicted
+  residual (and the mic's noise floor), ducking releases within 10 ms and stays off
+  for 300 ms after you stop. Your voice level is never changed. Ducking also never
+  engages unless echo is actually detected in the mic, so headphone users are left alone.
 - **Adaptive off**: the mic is simply attenuated by `strength` whenever the speakers
   are playing. Predictable, but you are muted while media plays.
 - The stage adds one block (~5 ms) of latency. Status is shown live in the section:
   whether the speakers are playing, whether echo is detected, how much is being
-  cancelled and how much is being ducked.
+  cancelled and ducked, and whether it currently hears you talking.
 - It cannot remove a *person* in the room: only sound the PC itself is playing.
 
 ## Installation

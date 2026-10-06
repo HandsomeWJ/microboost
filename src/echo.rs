@@ -25,10 +25,13 @@
 //!   so the comparison cannot be fooled by sample-to-sample tracking of the
 //!   near-end voice. Together this stands in for a double-talk detector.
 //! * Ducking (residual suppression). Adaptive mode: attenuate by
-//!   `strength − measured ERLE` while speakers are playing *and* echo is
-//!   detected in the mic (filter is cancelling, or envelopes correlate strongly),
-//!   so headphone users are never ducked. Simple mode: attenuate by `strength`
-//!   whenever the speakers are playing.
+//!   `strength − measured ERLE`, but only while speakers are playing, echo is
+//!   detected in the mic (filter is cancelling, or envelopes correlate strongly)
+//!   *and* the mic holds nothing but leftover echo. As soon as the error power
+//!   rises clearly above the residual the filter predicts, the near end is
+//!   talking: ducking releases within ~10 ms and stays off for a 300 ms
+//!   hangover. Headphone users are never ducked. Simple mode: attenuate by
+//!   `strength` whenever the speakers are playing.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -63,6 +66,24 @@ const ERLE_MAX_DB: f32 = 40.0;
 const ERLE_DECAY_DB: f32 = 0.005;
 /// How long the speakers count as "playing" after the last audible sample.
 const REF_HOLD_SEC: f32 = 0.3;
+/// Error power this many times above the predicted residual echo means the
+/// near end (the user) is talking. 9 dB of margin over the block-to-block
+/// spread of the cancellation.
+const NEAR_RATIO: f32 = 8.0;
+/// Asymmetric smoothing of the conservative ERLE (used for residual prediction
+/// and ducking depth): it follows drops 10× faster than rises, so it settles
+/// near the low end of the block-to-block spread instead of the mean.
+const ERLE_LOW_ALPHA_DOWN: f32 = 0.1;
+const ERLE_LOW_ALPHA_UP: f32 = 0.01;
+/// Upward drift of the error-floor tracker (minimum statistics): ≈2.6 dB/s.
+const FLOOR_RISE: f32 = 1.003;
+/// Hangover after the last near-end block before ducking may resume.
+const NEAR_HOLD_SEC: f32 = 0.3;
+/// Fast smoothing for the near-end decision (≈10 ms).
+const FAST_ALPHA: f32 = 0.5;
+/// ERLE decay while the near end talks (≈0.25 dB/s): self-corrects at the
+/// next pause, bounded so a stale estimate cannot suppress ducking forever.
+const ERLE_DECAY_NEAR_DB: f32 = 0.00125;
 
 /// Settings and live stats shared between the UI thread and the audio callback.
 pub struct Shared {
@@ -70,6 +91,7 @@ pub struct Shared {
     pub strength_db: AtomicU32, // f32 bits
     pub ref_active: AtomicBool,
     pub echo_detected: AtomicBool,
+    pub near_active: AtomicBool,
     pub erle_db: AtomicU32,  // f32 bits
     pub duck_db: AtomicU32,  // f32 bits
     pub delay_ms: AtomicU32, // f32 bits
@@ -83,6 +105,7 @@ impl Shared {
             strength_db: AtomicU32::new(strength_db.to_bits()),
             ref_active: AtomicBool::new(false),
             echo_detected: AtomicBool::new(false),
+            near_active: AtomicBool::new(false),
             erle_db: AtomicU32::new(0f32.to_bits()),
             duck_db: AtomicU32::new(0f32.to_bits()),
             delay_ms: AtomicU32::new(0f32.to_bits()),
@@ -284,6 +307,12 @@ pub struct EchoCanceller {
     sm_d: f32,
     sm_efg: f32,
     sm_ebg: f32,
+    fast_e: f32,
+    fast_y: f32,
+    e_floor: f32,
+    near_hold: usize,
+    near_hold_blocks: usize,
+    near_present: bool,
 
     // Envelope-based delay estimator.
     env_len: usize,
@@ -305,7 +334,8 @@ pub struct EchoCanceller {
     since_ref_active: usize,
     ref_hold: usize,
     corr_peak: f32,
-    erle_db: f32,
+    erle_db: f32,     // max-hold with slow decay: detection and window lock
+    erle_low_db: f32, // low-biased average over far-end-only blocks: residual prediction, ducking depth
     echo_detected: bool,
     duck_db: f32,
     duck_target: f32,
@@ -354,6 +384,12 @@ impl EchoCanceller {
             sm_d: 0.0,
             sm_efg: 0.0,
             sm_ebg: 0.0,
+            fast_e: 0.0,
+            fast_y: 0.0,
+            e_floor: 1.0,
+            near_hold: 0,
+            near_hold_blocks: ((NEAR_HOLD_SEC * srf) as usize / b).max(1),
+            near_present: false,
             env_len,
             env_acc_x: 0.0,
             env_acc_d: 0.0,
@@ -372,12 +408,13 @@ impl EchoCanceller {
             ref_hold: (REF_HOLD_SEC * srf) as usize,
             corr_peak: 0.0,
             erle_db: 0.0,
+            erle_low_db: 0.0,
             echo_detected: false,
             duck_db: 0.0,
             duck_target: 1.0,
             duck_gain: 1.0,
-            duck_attack: 1.0 - (-1.0 / (0.005 * srf)).exp(),
-            duck_release: 1.0 - (-1.0 / (0.2 * srf)).exp(),
+            duck_attack: 1.0 - (-1.0 / (0.03 * srf)).exp(),
+            duck_release: 1.0 - (-1.0 / (0.01 * srf)).exp(),
         }
     }
 
@@ -401,8 +438,14 @@ impl EchoCanceller {
         self.delay
     }
 
+    /// Best recent cancellation (max-hold, slow decay).
     pub fn erle_db(&self) -> f32 {
         self.erle_db
+    }
+
+    /// Conservative (low-biased) cancellation while only the speakers are heard.
+    pub fn erle_low_db(&self) -> f32 {
+        self.erle_low_db
     }
 
     pub fn echo_detected(&self) -> bool {
@@ -415,6 +458,25 @@ impl EchoCanceller {
 
     pub fn duck_gain(&self) -> f32 {
         self.duck_gain
+    }
+
+    /// True while the mic holds more than the predicted residual echo, i.e.
+    /// the user is talking (with hangover).
+    pub fn near_end_active(&self) -> bool {
+        self.near_present
+    }
+
+    #[cfg(test)]
+    fn debug_near(&self) -> String {
+        let residual = self.fast_y * 10f32.powf(-self.erle_low_db / 10.0);
+        format!(
+            "e/floor {:5.1} dB  e/y {:5.1} dB  e/d {:5.1} dB  e/residual {:5.1} dB, low {:.1}, max {:.1}, near {}, gain {:.2}",
+            10.0 * (self.fast_e / self.e_floor.max(1e-30)).log10(),
+            10.0 * (self.fast_e / self.fast_y.max(1e-30)).log10(),
+            10.0 * (self.sm_efg / self.sm_d.max(1e-30)).log10(),
+            10.0 * (self.fast_e / residual.max(1e-30)).log10(),
+            self.erle_low_db, self.erle_db, self.near_present, self.duck_gain
+        )
     }
 
     /// Index of the newest reference sample in the first half of the history.
@@ -518,17 +580,41 @@ impl EchoCanceller {
         self.fft.inverse(&mut self.buf_a);
         self.fft.inverse(&mut self.buf_b);
 
-        let (mut pd, mut pef, mut peb) = (0.0f32, 0.0f32, 0.0f32);
+        let (mut pd, mut pef, mut peb, mut py) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         for i in 0..b {
             let d = self.in_d[i];
-            let ef = d - self.buf_a[b + i].re;
+            let y = self.buf_a[b + i].re;
+            let ef = d - y;
             let eb = d - self.buf_b[b + i].re;
             self.out_e[i] = ef;
             self.e_bg_blk[i] = eb;
             pd += d * d;
             pef += ef * ef;
             peb += eb * eb;
+            py += y * y;
         }
+
+        // Near-end detection: once the filter works, the error should be at
+        // most the residual it predicts (echo estimate scaled by the conservative
+        // ERLE) or the mic's noise floor. Anything clearly louder than both is
+        // the user's own voice. The floor is frozen while the user talks so it
+        // never learns their voice as "noise".
+        self.fast_e += FAST_ALPHA * (pef - self.fast_e);
+        self.fast_y += FAST_ALPHA * (py - self.fast_y);
+        if !self.near_present {
+            self.e_floor = self.fast_e.min(self.e_floor * FLOOR_RISE).max(1e-20);
+        }
+        if self.erle_low_db >= ERLE_DETECT_DB {
+            let residual = self.fast_y * 10f32.powf(-self.erle_low_db / 10.0);
+            if self.fast_e > NEAR_RATIO * residual.max(self.e_floor) {
+                self.near_hold = self.near_hold_blocks;
+            } else {
+                self.near_hold = self.near_hold.saturating_sub(1);
+            }
+        } else {
+            self.near_hold = 0;
+        }
+        self.near_present = self.near_hold > 0;
 
         if ref_energy > REF_ACTIVE_RMS * REF_ACTIVE_RMS {
             // Background update: normalised block LMS per bin.
@@ -595,7 +681,25 @@ impl EchoCanceller {
                 }
                 let erle_inst =
                     (10.0 * (self.sm_d / self.sm_efg.max(1e-20)).log10()).clamp(0.0, ERLE_MAX_DB);
-                self.erle_db = erle_inst.max(self.erle_db - ERLE_DECAY_DB);
+                if self.near_present {
+                    // Error is dominated by the user's voice: do not read it as
+                    // lost ERLE. The slow decay self-corrects at the next pause
+                    // and stops a stale estimate from blocking ducking forever.
+                    self.erle_db = (self.erle_db - ERLE_DECAY_NEAR_DB).max(0.0);
+                    self.erle_low_db = (self.erle_low_db - ERLE_DECAY_NEAR_DB).max(0.0);
+                } else {
+                    self.erle_db = erle_inst.max(self.erle_db - ERLE_DECAY_DB);
+                    // Only blocks with real echo in them say anything about ERLE;
+                    // in silence e ≈ d ≈ noise and the ratio is meaningless.
+                    if pd > NEAR_RATIO * self.e_floor {
+                        let a = if erle_inst < self.erle_low_db {
+                            ERLE_LOW_ALPHA_DOWN
+                        } else {
+                            ERLE_LOW_ALPHA_UP
+                        };
+                        self.erle_low_db += a * (erle_inst - self.erle_low_db);
+                    }
+                }
             }
         }
 
@@ -607,8 +711,8 @@ impl EchoCanceller {
         self.duck_db = if !self.ref_active() {
             0.0
         } else if self.adaptive {
-            if self.echo_detected {
-                (self.strength_db - self.erle_db).max(0.0)
+            if self.echo_detected && !self.near_present {
+                (self.strength_db - self.erle_low_db).max(0.0)
             } else {
                 0.0
             }
@@ -701,9 +805,14 @@ impl EchoCanceller {
                     self.w_bg.fill(Cx::default());
                     self.xf.fill(Cx::default());
                     self.erle_db = 0.0;
+                    self.erle_low_db = 0.0;
                     self.sm_d = 0.0;
                     self.sm_efg = 0.0;
                     self.sm_ebg = 0.0;
+                    self.fast_e = 0.0;
+                    self.fast_y = 0.0;
+                    self.e_floor = 1.0;
+                    self.near_hold = 0;
                 }
             }
         }
@@ -717,7 +826,8 @@ impl EchoCanceller {
     pub fn publish(&self, s: &Shared) {
         s.ref_active.store(self.ref_active(), Ordering::Relaxed);
         s.echo_detected.store(self.echo_detected, Ordering::Relaxed);
-        Shared::set_f32(&s.erle_db, self.erle_db);
+        s.near_active.store(self.near_present, Ordering::Relaxed);
+        Shared::set_f32(&s.erle_db, self.erle_low_db);
         Shared::set_f32(&s.duck_db, self.duck_db);
         Shared::set_f32(&s.delay_ms, self.delay_ms());
         Shared::set_f32(&s.corr, self.corr_peak);
@@ -853,8 +963,8 @@ mod tests {
         let erle = db(pd, pe);
         let start = aec.window_start();
         eprintln!(
-            "ERLE {:.1} dB, window starts at {} samples ({} taps), est {:.1} ms, held ERLE {:.1}",
-            erle, start, aec.taps(), aec.delay_ms(), aec.erle_db()
+            "ERLE {:.1} dB, window starts at {} samples ({} taps), est {:.1} ms, held ERLE {:.1}, conservative {:.1}",
+            erle, start, aec.taps(), aec.delay_ms(), aec.erle_db(), aec.erle_low_db()
         );
         assert!(erle > 15.0, "ERLE {:.1} dB", erle);
         assert!(start <= delay && delay < start + aec.taps(), "window {}..{} misses {}", start, start + aec.taps(), delay);
@@ -901,22 +1011,39 @@ mod tests {
         let n = x.len();
         let dt_start = 7 * SR as usize;
         let dt_end = 13 * SR as usize;
+        let mut rng = Lcg(11);
         let mut aec = EchoCanceller::new(SR);
-        aec.set_params(true, 40.0);
+        // Strength above the 40 dB ERLE cap so far-end-only periods are ducked
+        // (by 20 dB) and the near-end periods have something to release from.
+        aec.set_params(true, 60.0);
         let lat = aec.latency();
         let mut near = vec![0.0f32; n];
         let mut d_all = vec![0.0f32; n];
         let mut e_all = vec![0.0f32; n];
+        // Far-end-only ducking is judged only while the speakers are playing;
+        // double-talk pass-through is weighted by the user's voice energy, so
+        // natural pauses (where re-ducking is correct) do not count against it.
+        let (mut gain_far_sum, mut gain_far_n) = (0.0f32, 0usize);
+        let (mut gain_dt_w, mut near_w) = (0.0f32, 0.0f32);
         let mut min_gain_dt = 1.0f32;
         for i in 0..n {
             near[i] = if i >= dt_start && i < dt_end { near_full[i] } else { 0.0 };
-            d_all[i] = echo[i] + near[i];
+            d_all[i] = echo[i] + near[i] + 5e-4 * rng.next_f32(); // ≈ −65 dBFS mic noise
             let (e, g) = aec.process_parts(d_all[i], x[i]);
             e_all[i] = e;
-            if i >= dt_start + SR as usize && i < dt_end {
+            if i >= 5 * SR as usize && i < dt_start && aec.ref_active() {
+                gain_far_sum += g;
+                gain_far_n += 1;
+            }
+            if i >= dt_start + SR as usize / 2 && i < dt_end {
+                let w = near[i] * near[i];
+                gain_dt_w += g * w;
+                near_w += w;
                 min_gain_dt = min_gain_dt.min(g);
             }
         }
+        let gain_far = gain_far_sum / gain_far_n as f32;
+        let gain_dt = gain_dt_w / near_w;
         let (mut p_near, mut p_dist) = (0.0f32, 0.0f32);
         for i in dt_start + SR as usize..dt_end {
             let nr = near[i - lat];
@@ -931,11 +1058,13 @@ mod tests {
         let distortion = db(p_dist, p_near);
         let erle_after = db(pd_tail, pe_tail);
         eprintln!(
-            "near-end distortion {:.1} dB, ERLE after double-talk {:.1} dB, min duck gain during double-talk {:.2}",
-            distortion, erle_after, min_gain_dt
+            "near-end distortion {:.1} dB, ERLE after double-talk {:.1} dB, conservative ERLE {:.1}, mean duck gain far-end-only {:.2}, voice-weighted gain during double-talk {:.2} (min {:.2})",
+            distortion, erle_after, aec.erle_low_db(), gain_far, gain_dt, min_gain_dt
         );
         assert!(distortion < -10.0, "near-end distortion {:.1} dB", distortion);
         assert!(erle_after > 12.0, "ERLE after double-talk {:.1} dB", erle_after);
+        assert!(gain_far < 0.2, "far-end-only period not ducked: mean gain {:.2}", gain_far);
+        assert!(gain_dt > 0.9, "user's voice ducked during double-talk: voice-weighted gain {:.2}", gain_dt);
     }
 
     #[test]

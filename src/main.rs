@@ -2600,9 +2600,14 @@ impl MicroboostApp {
                         if !self.settings.echo_adaptive {
                             format!("Speakers: playing · ducking {:.0} dB", duck)
                         } else if s.echo_detected.load(Ordering::Relaxed) {
+                            let who = if s.near_active.load(Ordering::Relaxed) {
+                                "you are talking"
+                            } else {
+                                "only echo"
+                            };
                             format!(
-                                "Speakers: playing · echo in mic · cancelling {:.0} dB · ducking {:.0} dB",
-                                erle, duck
+                                "Speakers: playing · echo in mic · cancelling {:.0} dB · ducking {:.0} dB · {}",
+                                erle, duck, who
                             )
                         } else {
                             "Speakers: playing · no echo detected in mic".to_string()
