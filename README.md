@@ -63,16 +63,21 @@ mic ─────────────────────────�
 
 - **Adaptive cancellation** (default): a partitioned frequency-domain adaptive filter
   learns the speaker→mic path (delay up to 1 s, 85 ms window) and subtracts the echo.
-  The leftover is ducked by `strength − cancelled dB`, but only while the mic holds
-  nothing but that leftover: as soon as your own voice is louder than the predicted
-  residual (and the mic's noise floor), ducking releases within 10 ms and stays off
-  for 300 ms after you stop. Your voice level is never changed. Ducking also never
-  engages unless echo is actually detected in the mic, so headphone users are left alone.
+  The leftover is then suppressed per frequency band: in each 5 ms frame, bands where
+  leftover speaker audio is louder than your voice are attenuated (down to a floor of
+  `strength − cancelled dB`), bands where your voice dominates are left alone. So the
+  speaker audio is reduced even while you talk, and your voice level is not changed.
+  Suppression only engages when echo is actually detected in the mic, so headphone
+  users are left alone.
 - **Adaptive off**: the mic is simply attenuated by `strength` whenever the speakers
   are playing. Predictable, but you are muted while media plays.
-- The stage adds one block (~5 ms) of latency. Status is shown live in the section:
+- The stage adds two blocks (~11 ms) of latency. Status is shown live in the section:
   whether the speakers are playing, whether echo is detected, how much is being
-  cancelled and ducked, and whether it currently hears you talking.
+  cancelled and suppressed, and whether it currently hears you talking.
+- Measured in the synthetic tests (speech fixture, 35 ms echo path, mic noise): while
+  you talk over the speakers the speaker audio is 39 dB below its raw level in the mic
+  and your voice passes at gain 1.00 with −29 dB distortion; with you silent the output
+  is 44 dB down.
 - It cannot remove a *person* in the room: only sound the PC itself is playing.
 
 ## Installation

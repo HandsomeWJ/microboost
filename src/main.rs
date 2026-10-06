@@ -2543,7 +2543,7 @@ impl MicroboostApp {
                     )
                     .on_hover_text(
                         "Captures what Windows is playing (podcasts, videos, call audio) \
-                         and cancels or ducks it out of the mic. Adds ~5 ms latency.",
+                         and cancels or ducks it out of the mic. Adds ~11 ms latency.",
                     )
                     .changed()
                 {
@@ -2556,8 +2556,9 @@ impl MicroboostApp {
                             "Adaptive cancellation (talk over media)",
                         )
                         .on_hover_text(
-                            "On: subtracts the speaker audio and only ducks the leftover, so you \
-                             can talk while something plays. Off: mutes the mic by the strength \
+                            "On: subtracts the speaker audio, then suppresses the leftover per \
+                             frequency band wherever it is louder than your voice, so you can \
+                             talk while something plays. Off: mutes the mic by the strength \
                              below whenever the speakers are playing.",
                         )
                         .changed()
@@ -2606,7 +2607,7 @@ impl MicroboostApp {
                                 "only echo"
                             };
                             format!(
-                                "Speakers: playing · echo in mic · cancelling {:.0} dB · ducking {:.0} dB · {}",
+                                "Speakers: playing · echo in mic · cancelling {:.0} dB · suppressing leftover up to {:.0} dB · {}",
                                 erle, duck, who
                             )
                         } else {

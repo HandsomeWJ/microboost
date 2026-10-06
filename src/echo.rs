@@ -2,8 +2,8 @@
 //!
 //! Removes what the PC is playing (podcasts, videos, call audio) from the mic
 //! signal, using a loopback copy of the speaker mix as the reference. Runs at
-//! the mic rate, before the boost gain is applied, and adds one block
-//! ([`EchoCanceller::latency`], ~5 ms) of latency to the mic path.
+//! the mic rate, before the boost gain is applied, and adds two blocks
+//! ([`EchoCanceller::latency`], ~11 ms) of latency to the mic path.
 //!
 //! ```text
 //! reference x ─► history ─► partitioned FD adaptive filters (bg adapts, fg = stable copy)
@@ -24,14 +24,18 @@
 //!   from the foreground when it has diverged. Updates happen once per block,
 //!   so the comparison cannot be fooled by sample-to-sample tracking of the
 //!   near-end voice. Together this stands in for a double-talk detector.
-//! * Ducking (residual suppression). Adaptive mode: attenuate by
-//!   `strength − measured ERLE`, but only while speakers are playing, echo is
-//!   detected in the mic (filter is cancelling, or envelopes correlate strongly)
-//!   *and* the mic holds nothing but leftover echo. As soon as the error power
-//!   rises clearly above the residual the filter predicts, the near end is
-//!   talking: ducking releases within ~10 ms and stays off for a 300 ms
-//!   hangover. Headphone users are never ducked. Simple mode: attenuate by
-//!   `strength` whenever the speakers are playing.
+//! * Residual suppression (adaptive mode): an STFT stage (same block size,
+//!   sqrt-Hann, 50 % overlap) applies a per-bin Wiener gain to the canceller
+//!   output. The residual echo in each bin is predicted from the filter's echo
+//!   estimate times a per-bin leak ratio learned while only the speakers are
+//!   heard; bins where the user's voice dominates keep a gain near 1, bins where
+//!   leftover echo dominates fall to the floor `strength − ERLE`. So the speaker
+//!   audio is reduced even while the user talks, at the frequencies their voice
+//!   is not occupying at that instant. A broadband near-end detector (error
+//!   power vs. predicted residual and mic noise floor) gates the leak learning.
+//!   Suppression never engages unless echo is detected in the mic, so headphone
+//!   users are untouched. Simple mode: broadband attenuation by `strength`
+//!   whenever the speakers are playing.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -81,6 +85,17 @@ const FLOOR_RISE: f32 = 1.003;
 const NEAR_HOLD_SEC: f32 = 0.3;
 /// Fast smoothing for the near-end decision (≈10 ms).
 const FAST_ALPHA: f32 = 0.5;
+/// Residual suppressor: over-subtraction of the predicted residual.
+const SUP_OVERSUB: f32 = 2.0;
+/// Residual suppressor: initial per-bin residual/estimate ratio (−10 dB).
+const SUP_LEAK_INIT: f32 = 0.1;
+/// Residual suppressor: learning rate of the per-bin leak (~100 ms).
+const SUP_LEAK_ALPHA: f32 = 0.05;
+/// Residual suppressor: smoothing of per-bin powers (~10 ms).
+const SUP_POW_ALPHA: f32 = 0.5;
+/// Residual suppressor: gain smoothing toward 1 (voice onset) and toward the floor.
+const SUP_GAIN_UP: f32 = 0.7;
+const SUP_GAIN_DOWN: f32 = 0.3;
 /// ERLE decay while the near end talks (≈0.25 dB/s): self-corrects at the
 /// next pause, bounded so a stale estimate cannot suppress ducking forever.
 const ERLE_DECAY_NEAR_DB: f32 = 0.00125;
@@ -276,6 +291,62 @@ impl Fft {
     }
 }
 
+/// Windowed overlap-add pass of one real block through fixed per-bin gains:
+/// frame = [prev | cur] × win, FFT, × gains (mirrored), IFFT, × win,
+/// overlap-add; emits the completed block into `out`. Used by the test-only
+/// shadow path; the live path does the same inline with e and y packed.
+#[cfg(test)]
+fn stft_apply(
+    fft: &Fft,
+    win: &[f32],
+    prev: &[f32],
+    cur: &[f32],
+    gains: &[f32],
+    buf: &mut [Cx],
+    ola: &mut [f32],
+    out: &mut [f32],
+) {
+    let b = prev.len();
+    let n = 2 * b;
+    for i in 0..b {
+        buf[i] = Cx::new(win[i] * prev[i], 0.0);
+        buf[b + i] = Cx::new(win[b + i] * cur[i], 0.0);
+    }
+    fft.forward(buf);
+    for k in 0..=b {
+        buf[k] = buf[k].scale(gains[k]);
+    }
+    for k in b + 1..n {
+        buf[k] = buf[n - k].conj();
+    }
+    fft.inverse(buf);
+    for i in 0..n {
+        ola[i] += buf[i].re * win[i];
+    }
+    for i in 0..b {
+        out[i] = ola[i];
+        ola[i] = ola[b + i];
+        ola[b + i] = 0.0;
+    }
+}
+
+/// Test-only shadow path: the echo and voice components of the mic signal are
+/// carried through the canceller's echo estimate and the suppressor's gains
+/// separately, so tests can measure leakage and voice distortion exactly.
+#[cfg(test)]
+struct Split {
+    d_echo: Vec<f32>,
+    d_near: Vec<f32>,
+    e_echo_prev: Vec<f32>,
+    e_echo_cur: Vec<f32>,
+    near_prev: Vec<f32>,
+    near_cur: Vec<f32>,
+    ola_echo: Vec<f32>,
+    ola_near: Vec<f32>,
+    out_echo: Vec<f32>,
+    out_near: Vec<f32>,
+}
+
 pub struct EchoCanceller {
     sr: u32,
     adaptive: bool,
@@ -304,6 +375,24 @@ pub struct EchoCanceller {
     buf_a: Vec<Cx>,
     buf_b: Vec<Cx>,
     e_bg_blk: Vec<f32>,
+    e_cur: Vec<f32>,
+    y_cur: Vec<f32>,
+
+    // Residual suppressor (STFT with hop b, frame n, sqrt-Hann in and out).
+    win: Vec<f32>,
+    e_prev: Vec<f32>,
+    y_prev: Vec<f32>,
+    sup_se: Vec<f32>,
+    sup_sy: Vec<f32>,
+    sup_leak: Vec<f32>,
+    sup_gain: Vec<f32>,
+    sup_gain_sm: Vec<f32>,
+    spec_e: Vec<Cx>,
+    ola: Vec<f32>,
+    sup_floor_db: f32,
+    #[cfg(test)]
+    split: Option<Split>,
+
     sm_d: f32,
     sm_efg: f32,
     sm_ebg: f32,
@@ -381,6 +470,23 @@ impl EchoCanceller {
             buf_a: vec![Cx::default(); n],
             buf_b: vec![Cx::default(); n],
             e_bg_blk: vec![0.0; b],
+            e_cur: vec![0.0; b],
+            y_cur: vec![0.0; b],
+            win: (0..n)
+                .map(|i| (0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos()).sqrt())
+                .collect(),
+            e_prev: vec![0.0; b],
+            y_prev: vec![0.0; b],
+            sup_se: vec![0.0; b + 1],
+            sup_sy: vec![0.0; b + 1],
+            sup_leak: vec![SUP_LEAK_INIT; b + 1],
+            sup_gain: vec![1.0; b + 1],
+            sup_gain_sm: vec![1.0; b + 1],
+            spec_e: vec![Cx::default(); b + 1],
+            ola: vec![0.0; n],
+            sup_floor_db: 0.0,
+            #[cfg(test)]
+            split: None,
             sm_d: 0.0,
             sm_efg: 0.0,
             sm_ebg: 0.0,
@@ -428,9 +534,14 @@ impl EchoCanceller {
         self.p * self.b
     }
 
-    /// Samples of delay this stage adds to the mic path (one block).
+    /// Samples of delay this stage adds to the mic path: one block for the
+    /// canceller plus one for the suppressor's overlap-add (adaptive mode).
     pub fn latency(&self) -> usize {
-        self.b
+        if self.adaptive {
+            2 * self.b
+        } else {
+            self.b
+        }
     }
 
     /// Start (in samples before "now") of the filter window.
@@ -464,6 +575,37 @@ impl EchoCanceller {
     /// the user is talking (with hangover).
     pub fn near_end_active(&self) -> bool {
         self.near_present
+    }
+
+    /// Test-only: like [`process_parts`](Self::process_parts) with the mic
+    /// signal given as echo + voice components. Returns
+    /// `(output, output's echo part, output's voice part)`.
+    #[cfg(test)]
+    fn process_split(&mut self, d_echo: f32, d_near: f32, x: f32) -> (f32, f32, f32) {
+        let b = self.b;
+        if self.split.is_none() {
+            self.split = Some(Split {
+                d_echo: vec![0.0; b],
+                d_near: vec![0.0; b],
+                e_echo_prev: vec![0.0; b],
+                e_echo_cur: vec![0.0; b],
+                near_prev: vec![0.0; b],
+                near_cur: vec![0.0; b],
+                ola_echo: vec![0.0; 2 * b],
+                ola_near: vec![0.0; 2 * b],
+                out_echo: vec![0.0; b],
+                out_near: vec![0.0; b],
+            });
+        }
+        let idx = self.in_count;
+        let (oe, on) = {
+            let sp = self.split.as_mut().unwrap();
+            sp.d_echo[idx] = d_echo;
+            sp.d_near[idx] = d_near;
+            (sp.out_echo[idx], sp.out_near[idx])
+        };
+        let (e, g) = self.process_parts(d_echo + d_near, x);
+        (e * g, oe * g, on * g)
     }
 
     #[cfg(test)]
@@ -544,6 +686,11 @@ impl EchoCanceller {
         let (b, n, p) = (self.b, self.n, self.p);
         if !self.adaptive {
             self.out_e.copy_from_slice(&self.in_d);
+            #[cfg(test)]
+            if let Some(sp) = self.split.as_mut() {
+                sp.out_echo.copy_from_slice(&sp.d_echo);
+                sp.out_near.copy_from_slice(&sp.d_near);
+            }
             self.update_duck();
             return;
         }
@@ -586,7 +733,8 @@ impl EchoCanceller {
             let y = self.buf_a[b + i].re;
             let ef = d - y;
             let eb = d - self.buf_b[b + i].re;
-            self.out_e[i] = ef;
+            self.e_cur[i] = ef;
+            self.y_cur[i] = y;
             self.e_bg_blk[i] = eb;
             pd += d * d;
             pef += ef * ef;
@@ -684,7 +832,7 @@ impl EchoCanceller {
                 if self.near_present {
                     // Error is dominated by the user's voice: do not read it as
                     // lost ERLE. The slow decay self-corrects at the next pause
-                    // and stops a stale estimate from blocking ducking forever.
+                    // and stops a stale estimate from blocking suppression forever.
                     self.erle_db = (self.erle_db - ERLE_DECAY_NEAR_DB).max(0.0);
                     self.erle_low_db = (self.erle_low_db - ERLE_DECAY_NEAR_DB).max(0.0);
                 } else {
@@ -703,7 +851,108 @@ impl EchoCanceller {
             }
         }
 
+        #[cfg(test)]
+        if let Some(sp) = self.split.as_mut() {
+            for i in 0..b {
+                sp.e_echo_cur[i] = sp.d_echo[i] - self.y_cur[i];
+                sp.near_cur[i] = sp.d_near[i];
+            }
+        }
         self.update_duck();
+        self.suppress_block();
+    }
+
+    /// Per-bin residual echo suppression on the canceller output (see module docs).
+    fn suppress_block(&mut self) {
+        let (b, n) = (self.b, self.n);
+        let active = self.echo_detected && self.ref_active();
+        let converged = self.erle_low_db >= ERLE_DETECT_DB;
+        let floor_db = if active {
+            (self.strength_db - self.erle_low_db).max(0.0)
+        } else {
+            0.0
+        };
+        let gmin = 10f32.powf(-floor_db / 20.0);
+        self.sup_floor_db = floor_db;
+
+        // Analysis of error and echo estimate in one complex FFT (e → re, y → im).
+        for i in 0..b {
+            self.buf_b[i] = Cx::new(self.win[i] * self.e_prev[i], self.win[i] * self.y_prev[i]);
+            self.buf_b[b + i] =
+                Cx::new(self.win[b + i] * self.e_cur[i], self.win[b + i] * self.y_cur[i]);
+        }
+        self.fft.forward(&mut self.buf_b);
+        let mut sy_max = 0.0f32;
+        for k in 0..=b {
+            let z = self.buf_b[k];
+            let zc = self.buf_b[(n - k) % n].conj();
+            let e = z.add(zc).scale(0.5);
+            let dif = z.sub(zc);
+            let y = Cx::new(dif.im * 0.5, -dif.re * 0.5);
+            self.spec_e[k] = e;
+            self.sup_se[k] += SUP_POW_ALPHA * (e.norm_sqr() - self.sup_se[k]);
+            self.sup_sy[k] += SUP_POW_ALPHA * (y.norm_sqr() - self.sup_sy[k]);
+            sy_max = sy_max.max(self.sup_sy[k]);
+        }
+
+        // Per-bin leak (residual / estimate) is learned only while the user is
+        // silent and the bin actually carries echo; then the Wiener gain.
+        let learn = active && converged && !self.near_present;
+        for k in 0..=b {
+            let se = self.sup_se[k];
+            let sy = self.sup_sy[k];
+            if learn && sy > 1e-3 * sy_max && sy > 1e-20 {
+                let ratio = (se / sy).min(1.0);
+                self.sup_leak[k] += SUP_LEAK_ALPHA * (ratio - self.sup_leak[k]);
+            }
+            let g = if !active {
+                1.0
+            } else if !converged {
+                gmin // filter not usable yet: plain broadband ducking
+            } else {
+                let r = self.sup_leak[k] * sy;
+                let near = (se - r).max(0.0);
+                (near / (near + SUP_OVERSUB * r + 1e-30)).max(gmin)
+            };
+            let a = if g > self.sup_gain[k] { SUP_GAIN_UP } else { SUP_GAIN_DOWN };
+            self.sup_gain[k] += a * (g - self.sup_gain[k]);
+        }
+        for k in 0..=b {
+            let lo = k.saturating_sub(1);
+            let hi = (k + 1).min(b);
+            let mut acc = 0.0;
+            for j in lo..=hi {
+                acc += self.sup_gain[j];
+            }
+            self.sup_gain_sm[k] = acc / (hi - lo + 1) as f32;
+        }
+
+        // Synthesis: apply gains, mirror to a Hermitian spectrum, overlap-add.
+        for k in 0..=b {
+            self.buf_a[k] = self.spec_e[k].scale(self.sup_gain_sm[k]);
+        }
+        for k in b + 1..n {
+            self.buf_a[k] = self.buf_a[n - k].conj();
+        }
+        self.fft.inverse(&mut self.buf_a);
+        for i in 0..n {
+            self.ola[i] += self.buf_a[i].re * self.win[i];
+        }
+        for i in 0..b {
+            self.out_e[i] = self.ola[i];
+            self.ola[i] = self.ola[b + i];
+            self.ola[b + i] = 0.0;
+        }
+        self.e_prev.copy_from_slice(&self.e_cur);
+        self.y_prev.copy_from_slice(&self.y_cur);
+
+        #[cfg(test)]
+        if let Some(sp) = self.split.as_mut() {
+            stft_apply(&self.fft, &self.win, &sp.e_echo_prev, &sp.e_echo_cur, &self.sup_gain_sm, &mut self.buf_a, &mut sp.ola_echo, &mut sp.out_echo);
+            stft_apply(&self.fft, &self.win, &sp.near_prev, &sp.near_cur, &self.sup_gain_sm, &mut self.buf_a, &mut sp.ola_near, &mut sp.out_near);
+            sp.e_echo_prev.copy_from_slice(&sp.e_echo_cur);
+            sp.near_prev.copy_from_slice(&sp.near_cur);
+        }
     }
 
     fn update_duck(&mut self) {
@@ -711,11 +960,7 @@ impl EchoCanceller {
         self.duck_db = if !self.ref_active() {
             0.0
         } else if self.adaptive {
-            if self.echo_detected && !self.near_present {
-                (self.strength_db - self.erle_low_db).max(0.0)
-            } else {
-                0.0
-            }
+            0.0 // handled per bin by the residual suppressor
         } else {
             self.strength_db
         };
@@ -813,6 +1058,9 @@ impl EchoCanceller {
                     self.fast_y = 0.0;
                     self.e_floor = 1.0;
                     self.near_hold = 0;
+                    self.sup_leak.fill(SUP_LEAK_INIT);
+                    self.sup_se.fill(0.0);
+                    self.sup_sy.fill(0.0);
                 }
             }
         }
@@ -828,7 +1076,7 @@ impl EchoCanceller {
         s.echo_detected.store(self.echo_detected, Ordering::Relaxed);
         s.near_active.store(self.near_present, Ordering::Relaxed);
         Shared::set_f32(&s.erle_db, self.erle_low_db);
-        Shared::set_f32(&s.duck_db, self.duck_db);
+        Shared::set_f32(&s.duck_db, if self.adaptive { self.sup_floor_db } else { self.duck_db });
         Shared::set_f32(&s.delay_ms, self.delay_ms());
         Shared::set_f32(&s.corr, self.corr_peak);
     }
@@ -1019,52 +1267,61 @@ mod tests {
         let lat = aec.latency();
         let mut near = vec![0.0f32; n];
         let mut d_all = vec![0.0f32; n];
-        let mut e_all = vec![0.0f32; n];
-        // Far-end-only ducking is judged only while the speakers are playing;
-        // double-talk pass-through is weighted by the user's voice energy, so
-        // natural pauses (where re-ducking is correct) do not count against it.
-        let (mut gain_far_sum, mut gain_far_n) = (0.0f32, 0usize);
-        let (mut gain_dt_w, mut near_w) = (0.0f32, 0.0f32);
-        let mut min_gain_dt = 1.0f32;
+        let mut out_all = vec![0.0f32; n];
+        let mut out_echo = vec![0.0f32; n];
+        let mut out_near = vec![0.0f32; n];
+        // Far-end-only suppression is judged only while the speakers are playing.
+        let (mut p_far_in, mut p_far_out) = (0.0f32, 0.0f32);
         for i in 0..n {
             near[i] = if i >= dt_start && i < dt_end { near_full[i] } else { 0.0 };
-            d_all[i] = echo[i] + near[i] + 5e-4 * rng.next_f32(); // ≈ −65 dBFS mic noise
-            let (e, g) = aec.process_parts(d_all[i], x[i]);
-            e_all[i] = e;
+            let d_echo = echo[i] + 1.5e-4 * rng.next_f32(); // ≈ −76 dBFS mic noise
+            d_all[i] = d_echo + near[i];
+            let (o, oe, on) = aec.process_split(d_echo, near[i], x[i]);
+            out_all[i] = o;
+            out_echo[i] = oe;
+            out_near[i] = on;
             if i >= 5 * SR as usize && i < dt_start && aec.ref_active() {
-                gain_far_sum += g;
-                gain_far_n += 1;
-            }
-            if i >= dt_start + SR as usize / 2 && i < dt_end {
-                let w = near[i] * near[i];
-                gain_dt_w += g * w;
-                near_w += w;
-                min_gain_dt = min_gain_dt.min(g);
+                p_far_in += d_all[i - lat] * d_all[i - lat];
+                p_far_out += out_all[i] * out_all[i];
             }
         }
-        let gain_far = gain_far_sum / gain_far_n as f32;
-        let gain_dt = gain_dt_w / near_w;
-        let (mut p_near, mut p_dist) = (0.0f32, 0.0f32);
+        let far_atten_db = db(p_far_out, p_far_in);
+        // Talk-over: how much speaker audio is left in the output (echo part,
+        // relative to the raw echo in the mic) and how much the voice changed.
+        let (mut p_echo, mut p_leak, mut p_near, mut p_vdist, mut s_on, mut s_nn) =
+            (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
         for i in dt_start + SR as usize..dt_end {
             let nr = near[i - lat];
+            let ec = echo[i - lat];
+            p_echo += ec * ec;
+            p_leak += out_echo[i] * out_echo[i];
             p_near += nr * nr;
-            p_dist += (e_all[i] - nr) * (e_all[i] - nr);
+            p_vdist += (out_near[i] - nr) * (out_near[i] - nr);
+            s_on += out_near[i] * nr;
+            s_nn += nr * nr;
         }
+        let leak_db = db(p_leak, p_echo);
+        let voice_dist_db = db(p_vdist, p_near);
+        let voice_gain = s_on / s_nn;
+        eprintln!(
+            "talk-over: speaker leakage {:.1} dB rel. raw echo, voice gain {:.2}, voice distortion {:.1} dB",
+            leak_db, voice_gain, voice_dist_db
+        );
         let (mut pd_tail, mut pe_tail) = (0.0f32, 0.0f32);
         for i in n - 3 * SR as usize..n {
             pd_tail += d_all[i - lat] * d_all[i - lat];
-            pe_tail += e_all[i] * e_all[i];
+            pe_tail += out_all[i] * out_all[i];
         }
-        let distortion = db(p_dist, p_near);
         let erle_after = db(pd_tail, pe_tail);
         eprintln!(
-            "near-end distortion {:.1} dB, ERLE after double-talk {:.1} dB, conservative ERLE {:.1}, mean duck gain far-end-only {:.2}, voice-weighted gain during double-talk {:.2} (min {:.2})",
-            distortion, erle_after, aec.erle_low_db(), gain_far, gain_dt, min_gain_dt
+            "output attenuation after double-talk {:.1} dB, conservative ERLE {:.1}, far-end-only output attenuation {:.1} dB",
+            erle_after, aec.erle_low_db(), far_atten_db
         );
-        assert!(distortion < -10.0, "near-end distortion {:.1} dB", distortion);
-        assert!(erle_after > 12.0, "ERLE after double-talk {:.1} dB", erle_after);
-        assert!(gain_far < 0.2, "far-end-only period not ducked: mean gain {:.2}", gain_far);
-        assert!(gain_dt > 0.9, "user's voice ducked during double-talk: voice-weighted gain {:.2}", gain_dt);
+        assert!(erle_after > 12.0, "attenuation after double-talk {:.1} dB", erle_after);
+        assert!(far_atten_db < -30.0, "far-end-only period not suppressed: {:.1} dB", far_atten_db);
+        assert!(voice_gain > 0.8, "user's voice attenuated during talk-over: gain {:.2}", voice_gain);
+        assert!(voice_dist_db < -15.0, "voice distortion during talk-over {:.1} dB", voice_dist_db);
+        assert!(leak_db < -32.0, "speaker leakage during talk-over only {:.1} dB", leak_db);
     }
 
     #[test]
