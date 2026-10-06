@@ -73,6 +73,10 @@ mic ─────────────────────────�
   to be attenuated is to be quieter than the leftover echo itself.
 - **Adaptive off**: the mic is simply attenuated by `strength` whenever the speakers
   are playing. Predictable, but you are muted while media plays.
+- The reference is aligned to the mic by capture timestamps (both WASAPI streams stamp
+  their buffers from the same performance counter), with the reference read 15 ms
+  earlier than the mic so the echo always lags it. Clock drift between mic and sound
+  card is nudged out two samples per callback.
 - The stage adds two blocks (~11 ms) of latency. Status is shown live in the section:
   whether the speakers are playing, whether echo is detected, how much is being
   cancelled and suppressed, and whether it currently hears you talking.

@@ -126,6 +126,9 @@ pub struct Shared {
     pub duck_db: AtomicU32,  // f32 bits
     pub delay_ms: AtomicU32, // f32 bits
     pub corr: AtomicU32,     // f32 bits
+    /// Mic capture time minus the reference's capture time at the aligned
+    /// position, in ms (written by the app's mic callback, diagnostic).
+    pub ref_offset_ms: AtomicU32, // f32 bits
 }
 
 impl Shared {
@@ -140,6 +143,7 @@ impl Shared {
             duck_db: AtomicU32::new(0f32.to_bits()),
             delay_ms: AtomicU32::new(0f32.to_bits()),
             corr: AtomicU32::new(0f32.to_bits()),
+            ref_offset_ms: AtomicU32::new(0f32.to_bits()),
         }
     }
 

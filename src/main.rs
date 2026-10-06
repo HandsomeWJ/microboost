@@ -2,7 +2,7 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
-use microboost::{echo, noise_gate, SpscRing, RING_SIZE};
+use microboost::{echo, noise_gate, RefRing, SpscRing, RING_SIZE};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -629,7 +629,9 @@ struct MicroboostApp {
 
     // Speaker echo suppression
     echo_shared: Arc<echo::Shared>,
-    ref_ring: Arc<SpscRing>,
+    ref_ring: Arc<RefRing>,
+    // (capture timestamp, ring position) of the first sample of the last loopback buffer
+    ref_anchor: Arc<Mutex<Option<(cpal::StreamInstant, u64)>>>,
     loopback_stream: Arc<Mutex<Option<cpal::Stream>>>,
     loopback_note: String,
 
@@ -751,7 +753,8 @@ impl MicroboostApp {
             _tray: tray,
             launch_with_windows,
             echo_shared,
-            ref_ring: Arc::new(SpscRing::new(RING_SIZE)),
+            ref_ring: Arc::new(RefRing::new(RING_SIZE)),
+            ref_anchor: Arc::new(Mutex::new(None)),
             loopback_stream: Arc::new(Mutex::new(None)),
             loopback_note: String::new(),
 
@@ -791,7 +794,8 @@ impl MicroboostApp {
     fn build_loopback(
         host: &cpal::Host,
         mic_rate: u32,
-        ring: Arc<SpscRing>,
+        ring: Arc<RefRing>,
+        anchor: Arc<Mutex<Option<(cpal::StreamInstant, u64)>>>,
         active: Arc<Mutex<bool>>,
     ) -> Result<cpal::Stream, String> {
         fn err_fn(e: cpal::StreamError) {
@@ -809,33 +813,40 @@ impl MicroboostApp {
         let format = cfg.sample_format();
         let stream_cfg: cpal::StreamConfig = cfg.into();
         ring.reset();
+        *anchor.lock().unwrap() = None;
         let mut rs = echo::LinearResampler::new(rate, mic_rate);
+        // Each buffer: remember where its first sample landed in the ring and
+        // when it was captured, so the mic side can align by time.
         let stream = match format {
             cpal::SampleFormat::F32 => dev.build_input_stream(
                 &stream_cfg,
-                move |data: &[f32], _| {
+                move |data: &[f32], info: &cpal::InputCallbackInfo| {
                     if !*active.lock().unwrap() {
                         return;
                     }
+                    let start = ring.write_pos();
                     for frame in data.chunks(channels) {
                         let mono = frame.iter().sum::<f32>() / channels as f32;
                         rs.push(mono, |s| ring.push(s));
                     }
+                    *anchor.lock().unwrap() = Some((info.timestamp().capture, start));
                 },
                 err_fn,
                 None,
             ),
             cpal::SampleFormat::I16 => dev.build_input_stream(
                 &stream_cfg,
-                move |data: &[i16], _| {
+                move |data: &[i16], info: &cpal::InputCallbackInfo| {
                     if !*active.lock().unwrap() {
                         return;
                     }
+                    let start = ring.write_pos();
                     for frame in data.chunks(channels) {
                         let mono = frame.iter().map(|&v| v as f32 / 32768.0).sum::<f32>()
                             / channels as f32;
                         rs.push(mono, |s| ring.push(s));
                     }
+                    *anchor.lock().unwrap() = Some((info.timestamp().capture, start));
                 },
                 err_fn,
                 None,
@@ -1060,6 +1071,7 @@ impl MicroboostApp {
                 &self.host,
                 in_sample_rate.0,
                 self.ref_ring.clone(),
+                self.ref_anchor.clone(),
                 self.pipeline_active.clone(),
             ) {
                 Ok(s) => loopback_stream = Some(s),
@@ -1068,30 +1080,67 @@ impl MicroboostApp {
         }
         let use_ref = loopback_stream.is_some();
         let ref_ring = self.ref_ring.clone();
+        let ref_anchor = self.ref_anchor.clone();
         let echo_shared = self.echo_shared.clone();
         let mut aec = echo::EchoCanceller::new(in_sample_rate.0);
-        // Keep the reference ring shallow so the popped sample is recent; the
-        // canceller looks back into its own history for the actual echo delay.
-        let max_fill = (in_sample_rate.0 / 10) as usize; // 100 ms
-        let target_fill = (in_sample_rate.0 / 50) as usize; // 20 ms
+        // Reference alignment by capture time: for the first mic sample of each
+        // callback, read the reference sample captured REF_MARGIN earlier (so the
+        // echo always lags the reference and the causal filter can model it),
+        // then step through consecutively. Small discrepancies (clock drift) are
+        // nudged out a couple of samples per callback; big ones re-sync.
+        const REF_MARGIN: std::time::Duration = std::time::Duration::from_millis(15);
+        let mic_rate_f = in_sample_rate.0 as f64;
+        let resync_thresh = (in_sample_rate.0 / 200) as i64; // 5 ms
+        let nudge: i64 = 2;
+        let mut next_read: Option<u64> = None;
 
         let in_stream_config: cpal::StreamConfig = in_config.into();
         let input_stream = input_device.build_input_stream(
             &in_stream_config,
-            move |data: &[f32], _| {
+            move |data: &[f32], info: &cpal::InputCallbackInfo| {
                 if !*active.lock().unwrap() {
                     return;
                 }
                 let gain = *gain_shared.lock().unwrap();
                 let mut gate = ng.lock().unwrap();
+                let mut ref_pos: Option<u64> = None;
                 if use_ref {
                     aec.set_params(
                         echo_shared.adaptive.load(Ordering::Relaxed),
                         echo::Shared::get_f32(&echo_shared.strength_db),
                     );
-                    let avail = ref_ring.available();
-                    if avail > max_fill {
-                        ref_ring.advance(avail - target_fill);
+                    let t_mic = info.timestamp().capture;
+                    if let Some((ts, pos)) = *ref_anchor.lock().unwrap() {
+                        let target = t_mic.sub(REF_MARGIN).unwrap_or(t_mic);
+                        let delta = match target.duration_since(&ts) {
+                            Some(d) => (d.as_secs_f64() * mic_rate_f).round() as i64,
+                            None => -(ts
+                                .duration_since(&target)
+                                .map(|d| (d.as_secs_f64() * mic_rate_f).round() as i64)
+                                .unwrap_or(0)),
+                        };
+                        let desired = (pos as i64 + delta).max(0) as u64;
+                        let cur = match next_read {
+                            Some(c) => {
+                                let diff = desired as i64 - c as i64;
+                                if diff.abs() > resync_thresh {
+                                    desired
+                                } else if diff > nudge {
+                                    c + nudge as u64
+                                } else if diff < -nudge {
+                                    c - nudge as u64
+                                } else {
+                                    c
+                                }
+                            }
+                            None => desired,
+                        };
+                        ref_pos = Some(cur);
+                        let off_ms = match t_mic.duration_since(&ts) {
+                            Some(d) => d.as_secs_f32() * 1000.0,
+                            None => -(ts.duration_since(&t_mic).map(|d| d.as_secs_f32()).unwrap_or(0.0) * 1000.0),
+                        };
+                        echo::Shared::set_f32(&echo_shared.ref_offset_ms, off_ms);
                     }
                 }
                 let mut sum_raw = 0.0f32;
@@ -1100,12 +1149,15 @@ impl MicroboostApp {
                 for chunk in data.chunks(in_channels) {
                     let mono = chunk[0];
                     let clean = if use_ref {
-                        let r = if ref_ring.available() > 0 {
-                            let s = ref_ring.peek(0);
-                            ref_ring.advance(1);
-                            s
-                        } else {
-                            0.0 // speakers idle: WASAPI loopback delivers nothing
+                        // None = not yet delivered or speakers idle (WASAPI
+                        // loopback sends nothing then): treat as silence.
+                        let r = match ref_pos.as_mut() {
+                            Some(p) => {
+                                let v = ref_ring.get(*p).unwrap_or(0.0);
+                                *p += 1;
+                                v
+                            }
+                            None => 0.0,
                         };
                         aec.process(mono, r)
                     } else {
@@ -1120,6 +1172,7 @@ impl MicroboostApp {
                     count += 1;
                 }
                 if use_ref {
+                    next_read = ref_pos;
                     aec.publish(&echo_shared);
                 }
                 if count > 0 {
@@ -2607,8 +2660,8 @@ impl MicroboostApp {
                                 "only echo"
                             };
                             format!(
-                                "Speakers: playing · echo in mic · cancelling {:.0} dB · suppressing leftover up to {:.0} dB · {}",
-                                erle, duck, who
+                                "Speakers: playing · echo in mic · cancelling {:.0} dB · suppressing leftover up to {:.0} dB · {} · ref {:+.0} ms",
+                                erle, duck, who, echo::Shared::get_f32(&s.ref_offset_ms)
                             )
                         } else {
                             "Speakers: playing · no echo detected in mic".to_string()

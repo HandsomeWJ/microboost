@@ -1,7 +1,7 @@
 pub mod echo;
 pub mod noise_gate;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const RING_SIZE: usize = 48000 * 2;
 
@@ -67,5 +67,78 @@ impl SpscRing {
     pub fn read_at(&self, pos: usize) -> f32 {
         let buf = unsafe { &*self.buf.get() };
         buf[pos % RING_SIZE]
+    }
+}
+
+/// Single-producer ring addressed by absolute sample position, used for the
+/// echo-cancellation reference. The producer only pushes; the consumer keeps
+/// its own cursor (chosen from capture timestamps) and reads with [`get`](Self::get),
+/// which returns `None` outside the window of samples still held.
+pub struct RefRing {
+    buf: std::cell::UnsafeCell<Vec<f32>>,
+    write: AtomicU64,
+    size: usize,
+}
+
+unsafe impl Send for RefRing {}
+unsafe impl Sync for RefRing {}
+
+impl RefRing {
+    pub fn new(size: usize) -> Self {
+        Self {
+            buf: std::cell::UnsafeCell::new(vec![0.0; size]),
+            write: AtomicU64::new(0),
+            size,
+        }
+    }
+
+    pub fn reset(&self) {
+        self.write.store(0, Ordering::Release);
+    }
+
+    /// Producer thread only.
+    #[inline]
+    pub fn push(&self, sample: f32) {
+        let w = self.write.load(Ordering::Relaxed);
+        let buf = unsafe { &mut *self.buf.get() };
+        buf[(w % self.size as u64) as usize] = sample;
+        self.write.store(w + 1, Ordering::Release);
+    }
+
+    /// Absolute position the next pushed sample will get.
+    #[inline]
+    pub fn write_pos(&self) -> u64 {
+        self.write.load(Ordering::Acquire)
+    }
+
+    /// Sample at absolute position `pos`, if it has been written and not yet
+    /// overwritten.
+    #[inline]
+    pub fn get(&self, pos: u64) -> Option<f32> {
+        let w = self.write_pos();
+        if pos >= w || pos + (self.size as u64) < w {
+            return None;
+        }
+        let buf = unsafe { &*self.buf.get() };
+        Some(buf[(pos % self.size as u64) as usize])
+    }
+}
+
+#[cfg(test)]
+mod ref_ring_tests {
+    use super::*;
+
+    #[test]
+    fn absolute_positions_and_window() {
+        let r = RefRing::new(8);
+        assert_eq!(r.get(0), None);
+        for i in 0..10 {
+            r.push(i as f32);
+        }
+        assert_eq!(r.write_pos(), 10);
+        assert_eq!(r.get(9), Some(9.0));
+        assert_eq!(r.get(2), Some(2.0)); // oldest still held: 10 - 8 = 2
+        assert_eq!(r.get(1), None); // overwritten
+        assert_eq!(r.get(10), None); // not yet written
     }
 }
