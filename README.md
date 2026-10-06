@@ -68,7 +68,9 @@ mic ─────────────────────────�
   `strength − cancelled dB`), bands where your voice dominates are left alone. So the
   speaker audio is reduced even while you talk, and your voice level is not changed.
   Suppression only engages when echo is actually detected in the mic, so headphone
-  users are left alone.
+  users are left alone. The leftover estimate is learned with minimum statistics, so
+  talking cannot poison it, and there is no broadband mute in this mode: the only way
+  to be attenuated is to be quieter than the leftover echo itself.
 - **Adaptive off**: the mic is simply attenuated by `strength` whenever the speakers
   are playing. Predictable, but you are muted while media plays.
 - The stage adds two blocks (~11 ms) of latency. Status is shown live in the section:
