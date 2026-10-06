@@ -634,6 +634,12 @@ struct MicroboostApp {
     ref_anchor: Arc<Mutex<Option<(cpal::StreamInstant, u64)>>>,
     loopback_stream: Arc<Mutex<Option<cpal::Stream>>>,
     loopback_note: String,
+    loopback_desc: String,
+    // 10 s echo diagnostic recording: (raw mic, aligned reference) pairs
+    diag_rec: Arc<Mutex<Option<Vec<(f32, f32)>>>>,
+    diag_cap: usize,
+    diag_rate: u32,
+    diag_note: String,
 
     // Noise gate
     noise_gate: Arc<Mutex<noise_gate::NoiseGate>>,
@@ -757,6 +763,11 @@ impl MicroboostApp {
             ref_anchor: Arc::new(Mutex::new(None)),
             loopback_stream: Arc::new(Mutex::new(None)),
             loopback_note: String::new(),
+            loopback_desc: String::new(),
+            diag_rec: Arc::new(Mutex::new(None)),
+            diag_cap: 0,
+            diag_rate: 48000,
+            diag_note: String::new(),
 
             noise_gate: Arc::new(Mutex::new(ng)),
             ng_cal_state: noise_gate::new_calibration_state(),
@@ -797,7 +808,7 @@ impl MicroboostApp {
         ring: Arc<RefRing>,
         anchor: Arc<Mutex<Option<(cpal::StreamInstant, u64)>>>,
         active: Arc<Mutex<bool>>,
-    ) -> Result<cpal::Stream, String> {
+    ) -> Result<(cpal::Stream, String), String> {
         fn err_fn(e: cpal::StreamError) {
             eprintln!("Loopback error: {}", e);
         }
@@ -855,8 +866,42 @@ impl MicroboostApp {
         }
         .map_err(|e| format!("{} ({})", e, name))?;
         stream.play().map_err(|e| format!("{} ({})", e, name))?;
-        eprintln!("Loopback: {} {}Hz {}ch -> {}Hz mono", name, rate, channels, mic_rate);
-        Ok(stream)
+        let desc = format!("{} {}Hz/{}ch {:?} → {}Hz", name, rate, channels, format, mic_rate);
+        eprintln!("Loopback: {}", desc);
+        Ok((stream, desc))
+    }
+
+    fn finish_diag_recording(&mut self) {
+        let done = {
+            let mut guard = self.diag_rec.lock().unwrap();
+            match guard.as_ref() {
+                Some(v) if self.diag_cap > 0 && v.len() >= self.diag_cap => guard.take(),
+                _ => None,
+            }
+        };
+        if let Some(samples) = done {
+            let dir = PathBuf::from(std::env::var("APPDATA").unwrap_or(".".to_string()))
+                .join("Microboost");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("echo_diag.wav");
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: self.diag_rate,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let result = hound::WavWriter::create(&path, spec).and_then(|mut w| {
+                for (m, r) in &samples {
+                    w.write_sample(*m)?;
+                    w.write_sample(*r)?;
+                }
+                w.finalize()
+            });
+            self.diag_note = match result {
+                Ok(()) => format!("Saved {} (mic L, reference R)", path.display()),
+                Err(e) => format!("Could not save diagnostic: {}", e),
+            };
+        }
     }
 
     fn find_input_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
@@ -1074,7 +1119,10 @@ impl MicroboostApp {
                 self.ref_anchor.clone(),
                 self.pipeline_active.clone(),
             ) {
-                Ok(s) => loopback_stream = Some(s),
+                Ok((s, desc)) => {
+                    loopback_stream = Some(s);
+                    self.loopback_desc = desc;
+                }
                 Err(e) => self.loopback_note = e,
             }
         }
@@ -1093,6 +1141,11 @@ impl MicroboostApp {
         let resync_thresh = (in_sample_rate.0 / 200) as i64; // 5 ms
         let nudge: i64 = 2;
         let mut next_read: Option<u64> = None;
+        let diag_rec = self.diag_rec.clone();
+        self.diag_cap = in_sample_rate.0 as usize * 10;
+        self.diag_rate = in_sample_rate.0;
+        let diag_cap = self.diag_cap;
+        let mut missing_ema = 0.0f32;
 
         let in_stream_config: cpal::StreamConfig = in_config.into();
         let input_stream = input_device.build_input_stream(
@@ -1146,6 +1199,9 @@ impl MicroboostApp {
                 let mut sum_raw = 0.0f32;
                 let mut sum_out = 0.0f32;
                 let mut count = 0usize;
+                let mut missing = 0usize;
+                let mut diag_guard = diag_rec.lock().unwrap();
+                let mut diag = diag_guard.as_mut();
                 for chunk in data.chunks(in_channels) {
                     let mono = chunk[0];
                     let clean = if use_ref {
@@ -1153,12 +1209,26 @@ impl MicroboostApp {
                         // loopback sends nothing then): treat as silence.
                         let r = match ref_pos.as_mut() {
                             Some(p) => {
-                                let v = ref_ring.get(*p).unwrap_or(0.0);
+                                let v = ref_ring.get(*p);
                                 *p += 1;
-                                v
+                                match v {
+                                    Some(v) => v,
+                                    None => {
+                                        missing += 1;
+                                        0.0
+                                    }
+                                }
                             }
-                            None => 0.0,
+                            None => {
+                                missing += 1;
+                                0.0
+                            }
                         };
+                        if let Some(rec) = diag.as_mut() {
+                            if rec.len() < diag_cap {
+                                rec.push((mono, r));
+                            }
+                        }
                         aec.process(mono, r)
                     } else {
                         mono
@@ -1173,6 +1243,10 @@ impl MicroboostApp {
                 }
                 if use_ref {
                     next_read = ref_pos;
+                    if count > 0 {
+                        missing_ema += 0.1 * (missing as f32 / count as f32 - missing_ema);
+                        echo::Shared::set_f32(&echo_shared.ref_missing, missing_ema);
+                    }
                     aec.publish(&echo_shared);
                 }
                 if count > 0 {
@@ -1792,6 +1866,9 @@ impl eframe::App for MicroboostApp {
         } else if self.frame_count == 2 && self.settings.minimize_to_tray && self.settings.start_in_tray {
             tray::hide_window();
         }
+
+        // Finish an echo diagnostic recording (file I/O on the UI thread)
+        self.finish_diag_recording();
 
         // Periodic device hot-plug detection
         if self.setup_state == SetupState::Ready
@@ -2673,6 +2750,44 @@ impl MicroboostApp {
                         .small()
                         .color(egui::Color32::from_rgb(140, 140, 150)),
                 );
+                if self.settings.echo_suppress && self.loopback_note.is_empty() {
+                    let s = &self.echo_shared;
+                    let diag = format!(
+                        "{} · corr {:.2} · lag {:+.0} ms · window {:.0}..{:.0} ms · ERLE max {:.0}/typ {:.0} dB · ref {:+.0} ms · missing {:.0}%",
+                        self.loopback_desc,
+                        echo::Shared::get_f32(&s.corr),
+                        echo::Shared::get_f32(&s.lag_ms),
+                        echo::Shared::get_f32(&s.window_ms),
+                        echo::Shared::get_f32(&s.window_ms) + 85.0,
+                        echo::Shared::get_f32(&s.erle_max_db),
+                        echo::Shared::get_f32(&s.erle_db),
+                        echo::Shared::get_f32(&s.ref_offset_ms),
+                        echo::Shared::get_f32(&s.ref_missing) * 100.0,
+                    );
+                    ui.label(
+                        egui::RichText::new(diag)
+                            .small()
+                            .color(egui::Color32::from_rgb(110, 110, 120)),
+                    );
+                    ui.horizontal(|ui| {
+                        let recording = self.diag_rec.lock().unwrap().is_some();
+                        if ui
+                            .add_enabled(!recording, egui::Button::new("Record 10 s echo diagnostic"))
+                            .on_hover_text(
+                                "Saves raw mic (left) and the speaker reference (right) to \
+                                 echo_diag.wav in the recordings folder, for offline analysis. \
+                                 Play a video and stay silent while it records.",
+                            )
+                            .clicked()
+                        {
+                            *self.diag_rec.lock().unwrap() = Some(Vec::with_capacity(self.diag_cap));
+                            self.diag_note = "Recording echo diagnostic…".to_string();
+                        }
+                        if !self.diag_note.is_empty() {
+                            ui.label(egui::RichText::new(&self.diag_note).small());
+                        }
+                    });
+                }
                 if restart {
                     profiles::save_settings(&self.settings);
                     let was_active = self.is_active;

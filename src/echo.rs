@@ -55,6 +55,9 @@ const WINDOW_SEC: f32 = 0.085;
 const MAX_DELAY_SEC: f32 = 1.0;
 const ENV_FRAMES_PER_SEC: u32 = 400; // 2.5 ms envelope frames
 const ENV_HISTORY_SEC: f32 = 3.0;
+/// Negative lags (mic leading the reference) searched for diagnosis only; the
+/// causal filter cannot use them.
+const NEG_LAG_SEC: f32 = 0.1;
 const EST_INTERVAL_SEC: f32 = 1.0;
 const MU: f32 = 0.5;
 /// Regularisation floor for per-bin normalisation, as a fraction of the mean
@@ -129,6 +132,14 @@ pub struct Shared {
     /// Mic capture time minus the reference's capture time at the aligned
     /// position, in ms (written by the app's mic callback, diagnostic).
     pub ref_offset_ms: AtomicU32, // f32 bits
+    /// Best envelope-correlation lag, ms (negative = mic leads reference).
+    pub lag_ms: AtomicU32, // f32 bits
+    /// Fraction of reference samples that were not available (0..1).
+    pub ref_missing: AtomicU32, // f32 bits
+    /// Filter window start, ms.
+    pub window_ms: AtomicU32, // f32 bits
+    /// Max-hold ERLE, dB.
+    pub erle_max_db: AtomicU32, // f32 bits
 }
 
 impl Shared {
@@ -144,6 +155,10 @@ impl Shared {
             delay_ms: AtomicU32::new(0f32.to_bits()),
             corr: AtomicU32::new(0f32.to_bits()),
             ref_offset_ms: AtomicU32::new(0f32.to_bits()),
+            lag_ms: AtomicU32::new(0f32.to_bits()),
+            ref_missing: AtomicU32::new(0f32.to_bits()),
+            window_ms: AtomicU32::new(0f32.to_bits()),
+            erle_max_db: AtomicU32::new(0f32.to_bits()),
         }
     }
 
@@ -440,6 +455,8 @@ pub struct EchoCanceller {
     lin_x: Vec<f32>,
     lin_d: Vec<f32>,
     max_lag: usize,
+    neg_lag: usize,
+    best_lag_frames: i64,
     frames_since_est: usize,
     est_every: usize,
 
@@ -468,6 +485,7 @@ impl EchoCanceller {
         let hist = max_delay + taps + n + 1;
         let env_n = (ENV_HISTORY_SEC * ENV_FRAMES_PER_SEC as f32) as usize;
         let max_lag = (MAX_DELAY_SEC * ENV_FRAMES_PER_SEC as f32) as usize;
+        let neg_lag = (NEG_LAG_SEC * ENV_FRAMES_PER_SEC as f32) as usize;
         let est_every = (EST_INTERVAL_SEC * ENV_FRAMES_PER_SEC as f32) as usize;
         let srf = sr as f32;
         Self {
@@ -537,6 +555,8 @@ impl EchoCanceller {
             lin_x: vec![0.0; env_n],
             lin_d: vec![0.0; env_n],
             max_lag,
+            neg_lag,
+            best_lag_frames: 0,
             frames_since_est: 0,
             est_every,
             since_ref_active: usize::MAX / 2,
@@ -1036,11 +1056,13 @@ impl EchoCanceller {
             self.lin_x[i] = self.env_x[j];
             self.lin_d[i] = self.env_d[j];
         }
-        let n = self.env_n - self.max_lag;
+        // Mic window ends `neg_lag` frames early so negative lags can be
+        // searched too (reference shifted into the most recent frames).
+        let n = self.env_n - self.max_lag - self.neg_lag;
         let nf = n as f32;
-        let mic = &self.lin_d[self.max_lag..];
+        let mic = &self.lin_d[self.max_lag..self.max_lag + n];
 
-        let active = self.lin_x[self.max_lag..]
+        let active = self.lin_x[self.max_lag..self.max_lag + n]
             .iter()
             .filter(|&&v| v > REF_ACTIVE_RMS)
             .count();
@@ -1055,10 +1077,11 @@ impl EchoCanceller {
             return;
         }
 
-        let mut best_l = 0usize;
+        let mut best_l = 0i64;
         let mut best_c = -1.0f32;
-        for l in 0..self.max_lag {
-            let xr = &self.lin_x[self.max_lag - l..self.env_n - l];
+        for l in -(self.neg_lag as i64)..self.max_lag as i64 {
+            let start = (self.max_lag as i64 - l) as usize;
+            let xr = &self.lin_x[start..start + n];
             let sx: f32 = xr.iter().sum();
             let sxx: f32 = xr.iter().map(|v| v * v).sum();
             let sxd = dot(xr, mic);
@@ -1074,9 +1097,12 @@ impl EchoCanceller {
             }
         }
         self.corr_peak = best_c.max(self.corr_peak * 0.8);
+        if best_c > CORR_RELOCATE {
+            self.best_lag_frames = best_l;
+        }
 
-        if best_c > CORR_RELOCATE && self.erle_db < ERLE_LOCK_DB {
-            let t = best_l * self.env_len;
+        if best_c > CORR_RELOCATE && self.erle_db < ERLE_LOCK_DB && best_l >= 0 {
+            let t = best_l as usize * self.env_len;
             let taps = self.taps();
             let lo = self.delay + taps / 8;
             let hi = self.delay + taps * 5 / 8;
@@ -1113,6 +1139,11 @@ impl EchoCanceller {
         (self.delay + self.taps() / 4) as f32 * 1000.0 / self.sr as f32
     }
 
+    /// Best envelope-correlation lag in ms (negative = mic leads the reference).
+    pub fn best_lag_ms(&self) -> f32 {
+        self.best_lag_frames as f32 * self.env_len as f32 * 1000.0 / self.sr as f32
+    }
+
     pub fn publish(&self, s: &Shared) {
         s.ref_active.store(self.ref_active(), Ordering::Relaxed);
         s.echo_detected.store(self.echo_detected, Ordering::Relaxed);
@@ -1121,6 +1152,9 @@ impl EchoCanceller {
         Shared::set_f32(&s.duck_db, if self.adaptive { self.sup_floor_db } else { self.duck_db });
         Shared::set_f32(&s.delay_ms, self.delay_ms());
         Shared::set_f32(&s.corr, self.corr_peak);
+        Shared::set_f32(&s.lag_ms, self.best_lag_ms());
+        Shared::set_f32(&s.window_ms, self.delay as f32 * 1000.0 / self.sr as f32);
+        Shared::set_f32(&s.erle_max_db, self.erle_db);
     }
 }
 
@@ -1289,6 +1323,26 @@ mod tests {
         eprintln!("long delay: ERLE {:.1} dB, window {}..{} for true delay {}, est {:.1} ms", erle, start, start + aec.taps(), delay, aec.delay_ms());
         assert!(start <= delay && delay < start + aec.taps(), "window {}..{} misses {}", start, start + aec.taps(), delay);
         assert!(erle > 15.0, "ERLE {:.1} dB", erle);
+        assert!((aec.best_lag_ms() - 150.0).abs() < 5.0, "lag estimate {:.1} ms", aec.best_lag_ms());
+    }
+
+    #[test]
+    fn negative_lag_is_reported_not_used() {
+        // Mic leading the reference by 40 ms: the causal filter cannot model it,
+        // but the estimator must report the negative lag so the app can tell.
+        let x = voice(10.0, 0.1, 0.0);
+        let (_, h) = echo_path(0.0);
+        let echo = convolve(&x, 0, &h);
+        let shift = (0.040 * SR as f32) as usize;
+        let mut aec = EchoCanceller::new(SR);
+        aec.set_params(true, 40.0);
+        for i in 0..x.len() - shift {
+            // reference delivered `shift` samples late relative to the echo
+            aec.process_parts(echo[i + shift], x[i]);
+        }
+        eprintln!("negative lag: estimate {:.1} ms, held ERLE {:.1}", aec.best_lag_ms(), aec.erle_db());
+        assert!((aec.best_lag_ms() + 40.0).abs() < 5.0, "lag estimate {:.1} ms", aec.best_lag_ms());
+        assert_eq!(aec.window_start(), 0);
     }
 
     #[test]
