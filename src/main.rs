@@ -58,7 +58,7 @@ mod profiles {
     }
 
     fn default_echo_strength() -> u32 {
-        40
+        50
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -93,7 +93,7 @@ mod profiles {
                 start_in_tray: false,
                 echo_suppress: true,
                 echo_adaptive: true,
-                echo_strength_db: 40,
+                echo_strength_db: 50,
             }
         }
     }
@@ -2700,10 +2700,16 @@ impl MicroboostApp {
                     }
                     ui.horizontal(|ui| {
                         ui.label("Strength:");
-                        let r = ui.add(
-                            egui::Slider::new(&mut self.settings.echo_strength_db, 6..=60)
-                                .suffix(" dB"),
-                        );
+                        let r = ui
+                            .add(
+                                egui::Slider::new(&mut self.settings.echo_strength_db, 6..=60)
+                                    .suffix(" dB"),
+                            )
+                            .on_hover_text(
+                                "Higher: more of the speaker audio removed, also while you talk, \
+                                 at the cost of a slightly thinner voice during playback. \
+                                 50 dB is a good start.",
+                            );
                         if r.changed() {
                             echo::Shared::set_f32(
                                 &self.echo_shared.strength_db,

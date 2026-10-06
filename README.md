@@ -62,15 +62,17 @@ mic ─────────────────────────�
 ```
 
 - **Adaptive cancellation** (default): a partitioned frequency-domain adaptive filter
-  learns the speaker→mic path (delay up to 1 s, 85 ms window) and subtracts the echo.
+  learns the speaker→mic path (delay up to 1 s, 85 ms window) and subtracts what it can.
   The leftover is then suppressed per frequency band: in each 5 ms frame, bands where
   leftover speaker audio is louder than your voice are attenuated (down to a floor of
-  `strength − cancelled dB`), bands where your voice dominates are left alone. So the
-  speaker audio is reduced even while you talk, and your voice level is not changed.
-  Suppression only engages when echo is actually detected in the mic, so headphone
-  users are left alone. The leftover estimate is learned with minimum statistics, so
-  talking cannot poison it, and there is no broadband mute in this mode: the only way
-  to be attenuated is to be quieter than the leftover echo itself.
+  `−strength`), bands where your voice dominates are left alone. So the speaker audio is
+  reduced even while you talk, and your voice level is not changed; the cost is a slightly
+  thinner voice in bands the echo also occupies while media plays. Strength sets how hard
+  the leftover is pushed down (16× over-prediction at 40 dB, doubling every 10 dB).
+  The leftover estimate is learned with minimum statistics, so talking cannot poison it,
+  and it keeps working when the linear canceller cancels little (mics often pick speakers
+  up as desk-borne bass that is only partly coherent with the signal). Suppression only
+  engages when echo is actually detected in the mic, so headphone users are left alone.
 - **Adaptive off**: the mic is simply attenuated by `strength` whenever the speakers
   are playing. Predictable, but you are muted while media plays.
 - The reference is aligned to the mic by capture timestamps (both WASAPI streams stamp
@@ -80,10 +82,10 @@ mic ─────────────────────────�
 - The stage adds two blocks (~11 ms) of latency. Status is shown live in the section:
   whether the speakers are playing, whether echo is detected, how much is being
   cancelled and suppressed, and whether it currently hears you talking.
-- Measured in the synthetic tests (speech fixture, 35 ms echo path, mic noise): while
-  you talk over the speakers the speaker audio is 39 dB below its raw level in the mic
-  and your voice passes at gain 1.00 with −29 dB distortion; with you silent the output
-  is 44 dB down.
+- Measured on a real room recording (USB mic needing 50x, desktop speakers, bass-heavy
+  pickup, canceller limited to ~5 dB): at 50 dB strength the output is 20 dB down with
+  you silent; talking 12 dB above the echo, the speaker audio is 8 dB down, your voice
+  passes at gain 0.96 with −19 dB distortion. Synthetic airborne echo: 37 dB and 40 dB.
 - It cannot remove a *person* in the room: only sound the PC itself is playing.
 
 ## Installation
